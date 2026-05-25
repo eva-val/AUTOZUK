@@ -1,5 +1,23 @@
 import { FLOOR_RAW } from '../data/floor';
 
+// Pre-parse FLOOR_RAW hex strings into typed-array RGB triples once at module load.
+// heatmapBlended() reads from these on every tile every frame, so the parseInt
+// round-trip dominates compared to a flat memory load.
+const _floorH = FLOOR_RAW.length;
+const _floorW = FLOOR_RAW[0]!.length;
+const FLOOR_R = new Uint8Array(_floorH * _floorW);
+const FLOOR_G = new Uint8Array(_floorH * _floorW);
+const FLOOR_B = new Uint8Array(_floorH * _floorW);
+for (let y = 0; y < _floorH; y++) {
+  for (let x = 0; x < _floorW; x++) {
+    const c = FLOOR_RAW[y]![x]!;
+    const i = y * _floorW + x;
+    FLOOR_R[i] = parseInt(c.slice(1, 3), 16);
+    FLOOR_G[i] = parseInt(c.slice(3, 5), 16);
+    FLOOR_B[i] = parseInt(c.slice(5, 7), 16);
+  }
+}
+
 export function heatmapColor(avgDmg: number, alpha?: number): string {
   if (Number.isNaN(avgDmg) || avgDmg === null) return `rgba(40,40,40,${alpha ?? 0.6})`;
   if (avgDmg < 0) avgDmg = 0;
@@ -86,12 +104,12 @@ export function heatmapBlended(avgDmg: number, fx: number, fy: number, maxBlend?
   }
   // For >60, blend with floor color so 51-60 remains visibly red.
   const mb = maxBlend ?? 0.8;
-  if (avgDmg > 60 && FLOOR_RAW[fy] && FLOOR_RAW[fy]![fx]) {
+  if (avgDmg > 60 && fy >= 0 && fy < _floorH && fx >= 0 && fx < _floorW) {
     const blend = Math.min((avgDmg - 60) / 50, mb);
-    const fc = FLOOR_RAW[fy]![fx]!;
-    const fr = parseInt(fc.slice(1, 3), 16);
-    const fg = parseInt(fc.slice(3, 5), 16);
-    const fb = parseInt(fc.slice(5, 7), 16);
+    const idx = fy * _floorW + fx;
+    const fr = FLOOR_R[idx]!;
+    const fg = FLOOR_G[idx]!;
+    const fb = FLOOR_B[idx]!;
     r = Math.round(r * (1 - blend) + fr * blend);
     g = Math.round(g * (1 - blend) + fg * blend);
     b = Math.round(b * (1 - blend) + fb * blend);
@@ -136,9 +154,16 @@ export function histogramColor(dmgVal: number): string {
   return `rgb(${r},${g},${b})`;
 }
 
+// MOB_DEFS colors are a small, fixed palette — memoize so we parse each hex string
+// exactly once per session instead of per draw call.
+const _darkCache = new Map<string, boolean>();
 export function isDarkColor(c: string): boolean {
+  const cached = _darkCache.get(c);
+  if (cached !== undefined) return cached;
   const r = parseInt(c.slice(1, 3), 16);
   const g = parseInt(c.slice(3, 5), 16);
   const b = parseInt(c.slice(5, 7), 16);
-  return (r * 299 + g * 587 + b * 114) / 1000 < 128;
+  const dark = (r * 299 + g * 587 + b * 114) / 1000 < 128;
+  _darkCache.set(c, dark);
+  return dark;
 }

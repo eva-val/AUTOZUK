@@ -195,13 +195,14 @@ export function prepareSimDamage(
     if (a.mobId > maxId) maxId = a.mobId;
     if (a.targetMobId !== undefined && a.targetMobId > maxId) maxId = a.targetMobId;
   }
-  // mobInitHP may carry ids that never appear in attacks (rare but possible). One pass
-  // over its enumerable own properties using the integer-coerced key keeps maxId
-  // upper-bounded correctly.
-  const initEntries = Object.keys(mobInitHP);
-  for (let i = 0; i < initEntries.length; i++) {
-    const v = +initEntries[i]!;
-    if (v > maxId) maxId = v;
+  // mobInitHP may carry ids that never appear in attacks (rare but possible). Walk its
+  // own enumerable keys directly — for...in avoids the Object.keys string-array
+  // allocation, and we coerce each key to a number exactly once.
+  if (hasRecoil) {
+    for (const k in mobInitHP) {
+      const id = +k;
+      if (id > maxId) maxId = id;
+    }
   }
   const maxIdPlus1 = maxId + 1;
   const initialMobHP = new Int32Array(maxIdPlus1);
@@ -209,9 +210,9 @@ export function prepareSimDamage(
     // Sentinel: -1 indicates the id was never seen in mobInitHP (e.g. an id that only
     // appears as a target via revive). The hot loop checks against >= 0 before applying.
     initialMobHP.fill(-1);
-    for (let i = 0; i < initEntries.length; i++) {
-      const k = initEntries[i]!;
-      initialMobHP[+k] = mobInitHP[+k]!.hp;
+    for (const k in mobInitHP) {
+      const id = +k;
+      initialMobHP[id] = mobInitHP[id]!.hp;
     }
   }
 
@@ -614,13 +615,28 @@ export function calcSimDamage(
 
 const DEFAULT_PRAYER_SEQ: PrayerSequence = ['mage', 'range', 'mage', 'range'];
 
-export function optimizePrayer(
+// Returned by optimizePrayerDetailed: same sequence/avgDamage that the public
+// optimizePrayer returns, plus the per-sim damage/died arrays for the WINNING combo
+// (so callers don't have to re-run applyPrayer / calcSimDamage to recover them) and the
+// prepared-sim cache (so subsequent calls on the same growing result set can pass it
+// back in to skip prepareSimDamage on already-seen sims).
+export interface PrayerSolutionDetailed {
+  sequence: PrayerSequence;
+  avgDamage: number;
+  perSimDamage: Int32Array;
+  perSimDied: Uint8Array;
+  perSimLen: number;
+  prepared: PreparedSim[];
+}
+
+export function optimizePrayerDetailed(
   allSimResults: SimResult[],
   spawnCode: string,
   _pillarConfig: PillarConfig,
   loadout: Loadout,
-  parsedSpawn?: ParsedSpawnCode
-): PrayerSolution {
+  parsedSpawn?: ParsedSpawnCode,
+  preparedCache?: PreparedSim[]
+): PrayerSolutionDetailed {
   const parsed = parsedSpawn ?? parseSpawnCode(spawnCode);
   const mobTypes = new Set<MobType>();
   if (!isSpawnCodeError(parsed)) {
@@ -631,9 +647,11 @@ export function optimizePrayer(
   const hasMeleer = mobTypes.has('meleer');
 
   const slots: (PrayerType | null)[] = [null, null, null, null];
-  const slotVotesMager: Record<number, number> = {};
-  const slotVotesRanger: Record<number, number> = {};
-  const slotVotesMeleer: Record<number, number> = {};
+  // Slot-vote tallies. Uint32Array(4) is zero-initialised and skips the polymorphic IC
+  // that a Record<number,number> would force in the hot voting loop.
+  const slotVotesMager = new Uint32Array(4);
+  const slotVotesRanger = new Uint32Array(4);
+  const slotVotesMeleer = new Uint32Array(4);
   const wantMager = hasMager;
   const wantRanger = hasRanger;
   const wantMeleer = hasMeleer;
@@ -644,23 +662,23 @@ export function optimizePrayer(
     for (const atk of result.attacks) {
       if (atk.isScan) continue;
       if (!foundMager && wantMager && atk.mobType === 'mager') {
-        slotVotesMager[atk.tick & 3] = (slotVotesMager[atk.tick & 3] ?? 0) + 1;
+        slotVotesMager[atk.tick & 3]!++;
         foundMager = true;
       } else if (!foundRanger && wantRanger && atk.mobType === 'ranger') {
-        slotVotesRanger[atk.tick & 3] = (slotVotesRanger[atk.tick & 3] ?? 0) + 1;
+        slotVotesRanger[atk.tick & 3]!++;
         foundRanger = true;
       } else if (!foundMeleer && wantMeleer && atk.mobType === 'meleer') {
-        slotVotesMeleer[atk.tick & 3] = (slotVotesMeleer[atk.tick & 3] ?? 0) + 1;
+        slotVotesMeleer[atk.tick & 3]!++;
         foundMeleer = true;
       }
       if ((!wantMager || foundMager) && (!wantRanger || foundRanger) && (!wantMeleer || foundMeleer)) break;
     }
   }
-  function getBestSlot(votes: Record<number, number>): number {
+  function getBestSlot(votes: Uint32Array): number {
     let best = -1;
     let bestCount = 0;
     for (let s = 0; s < 4; s++) {
-      const c = votes[s] ?? 0;
+      const c = votes[s]!;
       if (c > bestCount) {
         bestCount = c;
         best = s;
@@ -685,29 +703,83 @@ export function optimizePrayer(
   for (let i = 0; i < 4; i++) if (!slots[i]) unknowns.push(i);
 
   // Pre-prepare each sim once so the combo loop only pays applyPrayer cost.
-  const preparedSims: PreparedSim[] = new Array(allSimResults.length);
-  for (let i = 0; i < allSimResults.length; i++) {
-    preparedSims[i] = prepareSimDamage(allSimResults[i]!.attacks, loadout, allSimResults[i]!.mobInitHP);
+  // If the caller passed in a cache that's already aligned with allSimResults, reuse it
+  // and only prepare the suffix of fresh entries. The cache is mutated in place so the
+  // caller observes the new prepared entries on return.
+  const preparedSims: PreparedSim[] = preparedCache ?? new Array(allSimResults.length);
+  const N = allSimResults.length;
+  if (preparedCache) {
+    if (preparedSims.length < N) preparedSims.length = N;
+    for (let i = 0; i < N; i++) {
+      if (preparedSims[i] === undefined) {
+        preparedSims[i] = prepareSimDamage(allSimResults[i]!.attacks, loadout, allSimResults[i]!.mobInitHP);
+      }
+    }
+  } else {
+    for (let i = 0; i < N; i++) {
+      preparedSims[i] = prepareSimDamage(allSimResults[i]!.attacks, loadout, allSimResults[i]!.mobInitHP);
+    }
   }
 
+  // Reusable working buffer (length 4) — mutated per combo to avoid per-iteration
+  // array allocations. `bestSeq` is copied out only when we find a new best.
+  const workSeq: PrayerSequence = [
+    slots[0] ?? 'mage',
+    slots[1] ?? 'mage',
+    slots[2] ?? 'mage',
+    slots[3] ?? 'mage',
+  ];
+  // Scratch + best per-sim buffers for damage/died. We write into `scratch*` per combo
+  // and swap pointers with `best*` whenever a combo becomes the new minimum, avoiding
+  // any copy on improvement.
+  let bestDamage = new Int32Array(N);
+  let bestDied = new Uint8Array(N);
+  let scratchDamage = new Int32Array(N);
+  let scratchDied = new Uint8Array(N);
   let bestSeq: PrayerSequence | null = null;
   let bestDmg = Infinity;
   const combos = 1 << unknowns.length;
+  const nUnknowns = unknowns.length;
   for (let c = 0; c < combos; c++) {
-    const seq: (PrayerType | null)[] = [...slots];
-    for (let i = 0; i < unknowns.length; i++) {
-      seq[unknowns[i]!] = (c >> i) & 1 ? 'range' : 'mage';
+    for (let i = 0; i < nUnknowns; i++) {
+      workSeq[unknowns[i]!] = (c >> i) & 1 ? 'range' : 'mage';
     }
-    const finalSeq = seq.map((s) => s ?? 'mage') as PrayerType[];
     let totalDmg = 0;
-    for (let i = 0; i < preparedSims.length; i++) {
-      totalDmg += applyPrayer(preparedSims[i]!, finalSeq as PrayerSequence, loadout).damage;
+    for (let i = 0; i < N; i++) {
+      const r = applyPrayer(preparedSims[i]!, workSeq, loadout);
+      scratchDamage[i] = r.damage;
+      scratchDied[i] = r.died ? 1 : 0;
+      totalDmg += r.damage;
     }
-    const avgDmg = totalDmg / preparedSims.length;
+    const avgDmg = N > 0 ? totalDmg / N : Infinity;
     if (avgDmg < bestDmg) {
       bestDmg = avgDmg;
-      bestSeq = finalSeq as PrayerSequence;
+      bestSeq = [workSeq[0], workSeq[1], workSeq[2], workSeq[3]];
+      const td = bestDamage;
+      bestDamage = scratchDamage;
+      scratchDamage = td;
+      const tdd = bestDied;
+      bestDied = scratchDied;
+      scratchDied = tdd;
     }
   }
-  return { sequence: bestSeq ?? DEFAULT_PRAYER_SEQ, avgDamage: bestDmg };
+  return {
+    sequence: bestSeq ?? DEFAULT_PRAYER_SEQ,
+    avgDamage: bestDmg,
+    perSimDamage: bestDamage,
+    perSimDied: bestDied,
+    perSimLen: N,
+    prepared: preparedSims,
+  };
+}
+
+export function optimizePrayer(
+  allSimResults: SimResult[],
+  spawnCode: string,
+  pillarConfig: PillarConfig,
+  loadout: Loadout,
+  parsedSpawn?: ParsedSpawnCode
+): PrayerSolution {
+  const d = optimizePrayerDetailed(allSimResults, spawnCode, pillarConfig, loadout, parsedSpawn);
+  return { sequence: d.sequence, avgDamage: d.avgDamage };
 }

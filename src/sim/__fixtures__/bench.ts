@@ -3,7 +3,7 @@
 import { LOADOUTS } from '../../data/loadouts';
 import { createRegion } from '../../core/region';
 import type { PillarConfig } from '../../types';
-import { calcSimDamage, optimizePrayer } from '../prayerOptimizer';
+import { optimizePrayerDetailed, type PreparedSim } from '../prayerOptimizer';
 import { runHeadlessSim } from '../headless';
 
 // Mulberry32 RNG to take Math.random's quirks off the table.
@@ -29,14 +29,21 @@ function once(loadoutKey: keyof typeof LOADOUTS): number {
   const region = createRegion(PILLARS);
   const loadout = LOADOUTS[loadoutKey];
   const results = [];
+  const prepared: PreparedSim[] = [];
   const t0 = performance.now();
   for (let i = 0; i < SIMS_PER_RUN; i++) {
     const r = runHeadlessSim(SPAWN, TILE, PILLARS, loadout, MAX_TICKS, region);
     if (r) results.push(r);
   }
   if (results.length > 0) {
-    const pray = optimizePrayer(results, SPAWN, PILLARS, loadout);
-    for (const r of results) calcSimDamage(r.attacks, pray.sequence, loadout, r.mobInitHP);
+    // Mirrors the AUTOZUK final pass: one optimizePrayerDetailed call that
+    // prepares each sim exactly once and returns the per-sim damage/died arrays
+    // without a trailing calcSimDamage sweep.
+    const d = optimizePrayerDetailed(results, SPAWN, PILLARS, loadout, undefined, prepared);
+    // Touch the per-sim arrays so the compiler can't dead-code the call.
+    let s = 0;
+    for (let i = 0; i < d.perSimLen; i++) s += d.perSimDamage[i]!;
+    if (s < -1) console.log(s);
   }
   return performance.now() - t0;
 }

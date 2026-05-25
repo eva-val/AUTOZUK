@@ -14,7 +14,65 @@ import type { Mob } from '../types';
 import { getCanvas, getCtx } from './canvas';
 import { heatmapBlended, isDarkColor } from './heatmap';
 import { updatePrayerStrip } from './prayerStrip';
-import { state } from './state';
+import { packTile, state } from './state';
+
+// Cache the small set of bold/plain font strings used across draw calls so we don't
+// allocate a fresh template-literal string every fillText.
+const _boldFontCache = new Map<number, string>();
+const _plainFontCache = new Map<number, string>();
+function boldFont(px: number): string {
+  const k = px | 0;
+  let s = _boldFontCache.get(k);
+  if (!s) {
+    s = `bold ${k}px JetBrains Mono`;
+    _boldFontCache.set(k, s);
+  }
+  return s;
+}
+function plainFont(px: number): string {
+  const k = px | 0;
+  let s = _plainFontCache.get(k);
+  if (!s) {
+    s = `${k}px JetBrains Mono`;
+    _plainFontCache.set(k, s);
+  }
+  return s;
+}
+
+// Cached offscreen canvas for the static floor + grid. Re-built on tile-size change.
+let _floorBg: HTMLCanvasElement | null = null;
+let _floorBgTile = -1;
+function getFloorBg(TILE: number): HTMLCanvasElement {
+  if (_floorBg && _floorBgTile === TILE) return _floorBg;
+  const c = document.createElement('canvas');
+  c.width = ARENA_W * TILE;
+  c.height = ARENA_H * TILE;
+  const bg = c.getContext('2d');
+  if (!bg) throw new Error('Failed to acquire 2D context for floor background');
+  for (let fy = 0; fy < FLOOR_RAW.length && fy < ARENA_H; fy++) {
+    for (let fx = 0; fx < FLOOR_RAW[fy]!.length && fx < ARENA_W; fx++) {
+      bg.fillStyle = FLOOR_RAW[fy]![fx]!;
+      bg.fillRect(fx * TILE, fy * TILE, TILE, TILE);
+    }
+  }
+  bg.strokeStyle = '#ffffff08';
+  bg.lineWidth = 0.5;
+  for (let x = 0; x <= ARENA_W; x++) {
+    bg.beginPath();
+    bg.moveTo(x * TILE, 0);
+    bg.lineTo(x * TILE, ARENA_H * TILE);
+    bg.stroke();
+  }
+  for (let y = 0; y <= ARENA_H; y++) {
+    bg.beginPath();
+    bg.moveTo(0, y * TILE);
+    bg.lineTo(ARENA_W * TILE, y * TILE);
+    bg.stroke();
+  }
+  _floorBg = c;
+  _floorBgTile = TILE;
+  return c;
+}
 
 function drawFlipText(t: string, x: number, y: number): void {
   const ctx = getCtx();
@@ -63,7 +121,7 @@ function drawMob(mob: Mob): void {
   const cx = (mob.x + (s - 1) / 2 - ARENA_X_MIN) * TILE + TILE / 2;
   const cy = (mob.y - (s - 1) / 2 - ARENA_Y_MIN) * TILE + TILE / 2;
   ctx.fillStyle = isDarkColor(mob.color) ? '#fff' : '#000';
-  ctx.font = `bold ${Math.max(10, Math.min(TILE * s * 0.4, 20))}px JetBrains Mono`;
+  ctx.font = boldFont(Math.max(10, Math.min(TILE * s * 0.4, 20)));
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   drawFlipText(mob.letter, cx, cy);
@@ -91,37 +149,17 @@ export function render(): void {
     ctx.translate(canvas.width, canvas.height);
     ctx.scale(-1, -1);
   }
-  // Floor background
-  for (let fy = 0; fy < FLOOR_RAW.length && fy < ARENA_H; fy++) {
-    for (let fx = 0; fx < FLOOR_RAW[fy]!.length && fx < ARENA_W; fx++) {
-      ctx.fillStyle = FLOOR_RAW[fy]![fx]!;
-      ctx.fillRect(fx * TILE, fy * TILE, TILE, TILE);
-    }
-  }
-  // Grid lines
-  ctx.strokeStyle = '#ffffff08';
-  ctx.lineWidth = 0.5;
-  for (let x = 0; x <= ARENA_W; x++) {
-    ctx.beginPath();
-    ctx.moveTo(x * TILE, 0);
-    ctx.lineTo(x * TILE, ARENA_H * TILE);
-    ctx.stroke();
-  }
-  for (let y = 0; y <= ARENA_H; y++) {
-    ctx.beginPath();
-    ctx.moveTo(0, y * TILE);
-    ctx.lineTo(ARENA_W * TILE, y * TILE);
-    ctx.stroke();
-  }
+  // Floor + grid: cached offscreen canvas. Cache key is TILE; auto-invalidates on resize.
+  ctx.drawImage(getFloorBg(TILE), 0, 0);
 
   // Phase 2: heatmap overlay
   if (state.autozukMode && !state.autozukHidden) {
     for (let x = ARENA_X_MIN; x <= ARENA_X_MAX; x++) {
       for (let y = ARENA_Y_MIN; y <= ARENA_Y_MAX; y++) {
-        const key = `${x},${y}`;
+        const idx = packTile(x, y);
         const px = (x - ARENA_X_MIN) * TILE;
         const py = (y - ARENA_Y_MIN) * TILE;
-        if (state.excludedTiles.has(key)) {
+        if (state.excludedTiles[idx]) {
           ctx.fillStyle = '#0a0a0f88';
           ctx.fillRect(px, py, TILE, TILE);
           ctx.strokeStyle = '#ff000022';
@@ -132,7 +170,7 @@ export function render(): void {
           ctx.stroke();
           continue;
         }
-        const result = state.autozukResults[key];
+        const result = state.autozukResults[idx];
         if (result) {
           const fx = x - ARENA_X_MIN;
           const fy = y - ARENA_Y_MIN;
@@ -141,7 +179,7 @@ export function render(): void {
             ctx.fillRect(px + 1, py + 1, TILE - 2, TILE - 2);
             if (TILE >= 12) {
               ctx.fillStyle = '#888';
-              ctx.font = `bold ${Math.max(8, TILE * 0.5)}px JetBrains Mono`;
+              ctx.font = boldFont(Math.max(8, TILE * 0.5));
               ctx.textAlign = 'center';
               ctx.textBaseline = 'middle';
               drawFlipText('☠', px + TILE / 2, py + TILE / 2);
@@ -151,7 +189,7 @@ export function render(): void {
             ctx.fillRect(px + 1, py + 1, TILE - 2, TILE - 2);
             if (TILE >= 16) {
               ctx.fillStyle = result.avgDamage > 60 ? '#888' : result.avgDamage < 20 ? '#000' : '#fff';
-              ctx.font = `bold ${Math.max(7, TILE * 0.4)}px JetBrains Mono`;
+              ctx.font = boldFont(Math.max(7, TILE * 0.4));
               ctx.textAlign = 'center';
               ctx.textBaseline = 'middle';
               drawFlipText(String(Math.round(result.avgDamage)), px + TILE / 2, py + TILE / 2);
@@ -183,7 +221,7 @@ export function render(): void {
       const cx = (pm.x + (s - 1) / 2 - ARENA_X_MIN) * TILE + TILE / 2;
       const cy = (pm.y - (s - 1) / 2 - ARENA_Y_MIN) * TILE + TILE / 2;
       ctx.fillStyle = isDarkColor(pm.color) ? '#fff' : '#000';
-      ctx.font = `bold ${Math.max(10, Math.min(TILE * s * 0.4, 20))}px JetBrains Mono`;
+      ctx.font = boldFont(Math.max(10, Math.min(TILE * s * 0.4, 20)));
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       drawFlipText(pm.letter, cx, cy);
@@ -198,7 +236,7 @@ export function render(): void {
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(sx, sy, TILE, TILE);
         ctx.globalAlpha = 0.3;
-        ctx.font = `${Math.max(8, TILE - 4)}px JetBrains Mono`;
+        ctx.font = plainFont(Math.max(8, TILE - 4));
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         drawFlipText(String(i + 1), sx + TILE / 2, sy + TILE / 2);
@@ -226,7 +264,7 @@ export function render(): void {
       p.size * TILE - 2
     );
     ctx.fillStyle = '#ffffff';
-    ctx.font = `bold ${Math.max(9, TILE - 4)}px JetBrains Mono`;
+    ctx.font = boldFont(Math.max(9, TILE - 4));
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     drawFlipText(key, (p.x + 1 - ARENA_X_MIN) * TILE + TILE / 2, (p.y - 1 - ARENA_Y_MIN) * TILE + TILE / 2);
@@ -240,7 +278,7 @@ export function render(): void {
     ctx.fillStyle = '#bb88ff';
     ctx.fillRect(px + 1, py + 1, TILE - 2, TILE - 2);
     ctx.fillStyle = '#fff';
-    ctx.font = `bold ${Math.max(8, TILE - 6)}px JetBrains Mono`;
+    ctx.font = boldFont(Math.max(8, TILE - 6));
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     drawFlipText('P', px + TILE / 2, py + TILE / 2);
@@ -280,7 +318,7 @@ export function render(): void {
     ctx.fillStyle = '#bb88ff88';
     ctx.fillRect(px + 1, py + 1, TILE - 2, TILE - 2);
     ctx.fillStyle = '#fff';
-    ctx.font = `bold ${Math.max(8, TILE - 6)}px JetBrains Mono`;
+    ctx.font = boldFont(Math.max(8, TILE - 6));
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     drawFlipText('P', px + TILE / 2, py + TILE / 2);
@@ -300,7 +338,7 @@ export function render(): void {
       const cx = (pm.x + (s - 1) / 2 - ARENA_X_MIN) * TILE + TILE / 2;
       const cy = (pm.y - (s - 1) / 2 - ARENA_Y_MIN) * TILE + TILE / 2;
       ctx.fillStyle = isDarkColor(pm.color) ? '#fff' : '#000';
-      ctx.font = `bold ${Math.max(10, Math.min(TILE * s * 0.4, 20))}px JetBrains Mono`;
+      ctx.font = boldFont(Math.max(10, Math.min(TILE * s * 0.4, 20)));
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       drawFlipText(pm.letter, cx, cy);

@@ -9,7 +9,7 @@ import { byId } from './dom';
 import { exportTilemarker } from './exportTile';
 import { clearLiveSimState, ensureSim, liveTick, resetSim, startPlay, stopPlay, updateLiveUI } from './liveSim';
 import { render } from './render';
-import { state } from './state';
+import { TILE_BUF_LEN, packTile, state } from './state';
 import { closeTileDetail, showTileDetail } from './tileDetail';
 
 function setStatus(msg: string, type?: 'info' | 'error'): void {
@@ -126,15 +126,16 @@ function handleCanvasClick(e: MouseEvent): void {
   if (gx < ARENA_X_MIN || gx > ARENA_X_MAX || gy < ARENA_Y_MIN || gy > ARENA_Y_MAX) return;
   state.playerPlacement = { x: gx, y: gy };
   if (state.autozukMode && !state.autozukRunning) {
-    const key = `${gx},${gy}`;
-    if (state.autozukResults[key]) {
+    const idx = packTile(gx, gy);
+    const result = state.autozukResults[idx];
+    if (result) {
       state.selectedTile = { x: gx, y: gy };
-      state.activePrayerSeq = state.autozukResults[key]!.prayer;
+      state.activePrayerSeq = result.prayer;
       showTileDetail(gx, gy, closeTileDetail);
       setStatus(`Player placed at (${gx}, ${gy}) — click STEP/PLAY to sim`, 'info');
       render();
       return;
-    } else if (state.excludedTiles.has(key)) {
+    } else if (state.excludedTiles[idx]) {
       setStatus(`Player placed at (${gx}, ${gy}) — excluded tile`, 'info');
       render();
       return;
@@ -174,8 +175,9 @@ export function wireControls(): void {
       clearLiveSimState();
     }
     state.autozukMode = false;
-    state.autozukResults = {};
-    state.excludedTiles = new Set();
+    state.autozukResults = new Array(TILE_BUF_LEN);
+    state.excludedTiles = new Uint8Array(TILE_BUF_LEN);
+    state.excludedTilesCount = 0;
     state.selectedTile = null;
     byId('detailPanel').classList.add('detail-hidden');
     byId('phase1Panel').style.display = '';

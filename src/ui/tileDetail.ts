@@ -1,7 +1,7 @@
 import type { AutozukResult } from '../types';
 import { byId } from './dom';
 import { histogramColor } from './heatmap';
-import { state } from './state';
+import { packTile, state } from './state';
 
 const PRAYER_NAMES = { mage: 'MAGE', range: 'RANGE', melee: 'MELEE' } as const;
 const SLOT_LABELS = ['START', 'T1', 'T2', 'T3'] as const;
@@ -52,8 +52,7 @@ function drawHistogram(canvasId: string, damages: number[]): void {
 }
 
 export function showTileDetail(x: number, y: number, onClose: () => void): void {
-  const key = `${x},${y}`;
-  const result = state.autozukResults[key];
+  const result = state.autozukResults[packTile(x, y)];
   if (!result) {
     byId('detailPanel').classList.add('detail-hidden');
     return;

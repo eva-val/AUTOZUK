@@ -5,7 +5,7 @@ import { MOB_DEFS } from '../data/mobs';
 import { initSimState } from '../sim/engine';
 import { checkTileExcluded } from '../sim/exclusion';
 import { runHeadlessSim } from '../sim/headless';
-import { calcSimDamage, optimizePrayer } from '../sim/prayerOptimizer';
+import { optimizePrayerDetailed, type PreparedSim } from '../sim/prayerOptimizer';
 import type { AutozukResult, Tile } from '../types';
 import { playExclusionBlip, playScoreBlip } from './audio';
 import { updatePreview } from './controls';
@@ -13,7 +13,7 @@ import { byId } from './dom';
 import { heatmapColor } from './heatmap';
 import { liveTick, stopPlay, updateLiveUI } from './liveSim';
 import { render } from './render';
-import { state } from './state';
+import { TILE_BUF_LEN, TILE_STRIDE, packTile, state } from './state';
 import { closeTileDetail, showTileDetail, updateLiveDetail } from './tileDetail';
 
 const PRAYER_LABELS = { mage: 'M', range: 'R', melee: 'X' } as const;
@@ -52,8 +52,9 @@ export async function startAutozuk(): Promise<void> {
 
   state.autozukRunning = true;
   state.autozukMode = true;
-  state.autozukResults = {};
-  state.excludedTiles = new Set();
+  state.autozukResults = new Array(TILE_BUF_LEN);
+  state.excludedTiles = new Uint8Array(TILE_BUF_LEN);
+  state.excludedTilesCount = 0;
   state.selectedTile = null;
   state.activePrayerSeq = null;
   state.autozukHidden = false;
@@ -107,7 +108,8 @@ export async function startAutozuk(): Promise<void> {
       while (exIdx < allTiles.length && count < 20) {
         const t = allTiles[exIdx]!;
         if (checkTileExcluded(t.x, t.y, testMobs, testRegion)) {
-          state.excludedTiles.add(`${t.x},${t.y}`);
+          state.excludedTiles[packTile(t.x, t.y)] = 1;
+          state.excludedTilesCount++;
           playExclusionBlip();
         } else {
           eligibleTiles.push(t);
@@ -126,7 +128,7 @@ export async function startAutozuk(): Promise<void> {
     sweepBatch();
   });
 
-  setStatus(`${eligibleTiles.length} tiles to simulate, ${state.excludedTiles.size} excluded`, 'info');
+  setStatus(`${eligibleTiles.length} tiles to simulate, ${state.excludedTilesCount} excluded`, 'info');
 
   // STEP 2: simulate each eligible tile
   const totalTiles = eligibleTiles.length;
@@ -134,7 +136,7 @@ export async function startAutozuk(): Promise<void> {
   const cachedRegion = createRegion(state.pillars);
   for (let ti = 0; ti < totalTiles; ti++) {
     const tile = eligibleTiles[ti]!;
-    const key = `${tile.x},${tile.y}`;
+    const tileIdx = packTile(tile.x, tile.y);
     byId('autozukStatus').textContent = `Simulating tile ${ti + 1}/${totalTiles} (${tile.x},${tile.y})...`;
 
     // Quick live preview (30 ticks, batched into 5 animation frames of 6 ticks each)
@@ -167,50 +169,50 @@ export async function startAutozuk(): Promise<void> {
       });
     }
 
-    // Headless sims
-    const allResults: Array<ReturnType<typeof runHeadlessSim>> = [];
+    // Headless sims. `prepared` is built incrementally inside optimizePrayerDetailed
+    // (we pass it back in on each call), so prepareSimDamage runs at most once per sim.
+    type ValidResult = NonNullable<ReturnType<typeof runHeadlessSim>>;
+    const validResults: ValidResult[] = [];
+    const prepared: PreparedSim[] = [];
     for (let s = 0; s < maxSims; s++) {
       const result = runHeadlessSim(code, tile, state.pillars, loadout, maxTicks, cachedRegion);
-      if (result) allResults.push(result);
-      // Early death termination
-      if (s === 2 && allResults.length >= 3) {
-        const quickPrayer = optimizePrayer(
-          allResults.filter((r) => r !== null) as Exclude<typeof result, null>[],
-          code,
-          state.pillars,
-          loadout
-        );
-        const allDead = allResults.every(
-          (r) => r && calcSimDamage(r.attacks, quickPrayer.sequence, loadout, r.mobInitHP).died
-        );
+      if (result) validResults.push(result);
+      // Early death termination — at s=2 verify all sims died under the locally-best prayer.
+      if (s === 2 && validResults.length >= 3) {
+        const quick = optimizePrayerDetailed(validResults, code, state.pillars, loadout, undefined, prepared);
+        let allDead = true;
+        for (let i = 0; i < quick.perSimLen; i++) {
+          if (quick.perSimDied[i] === 0) {
+            allDead = false;
+            break;
+          }
+        }
         if (allDead) break;
       }
-      if (s === 9 && allResults.length >= 10) {
-        const validResults = allResults.filter((r) => r !== null) as Exclude<typeof result, null>[];
-        const quickPrayer = optimizePrayer(validResults, code, state.pillars, loadout);
-        const quickDmgs = validResults.map(
-          (r) => calcSimDamage(r.attacks, quickPrayer.sequence, loadout, r.mobInitHP).damage
-        );
-        const quickAvg = quickDmgs.reduce((a, b) => a + b, 0) / quickDmgs.length;
+      if (s === 9 && validResults.length >= 10) {
+        const quick = optimizePrayerDetailed(validResults, code, state.pillars, loadout, undefined, prepared);
+        let sum = 0;
+        for (let i = 0; i < quick.perSimLen; i++) sum += quick.perSimDamage[i]!;
+        const quickAvg = sum / quick.perSimLen;
         if (quickAvg > 80) break;
       }
     }
 
-    const validResults = allResults.filter((r) => r !== null) as NonNullable<(typeof allResults)[number]>[];
     if (validResults.length > 0) {
-      const prayer = optimizePrayer(validResults, code, state.pillars, loadout);
+      const detailed = optimizePrayerDetailed(validResults, code, state.pillars, loadout, undefined, prepared);
+      const prayer = { sequence: detailed.sequence, avgDamage: detailed.avgDamage };
       const damages: number[] = [];
       const completionTicks: number[] = [];
       let invalidCount = 0;
       let deathCount = 0;
-      for (const r of validResults) {
+      for (let i = 0; i < validResults.length; i++) {
+        const r = validResults[i]!;
         if (r.status === 'invalid') {
           invalidCount++;
           continue;
         }
-        const res = calcSimDamage(r.attacks, prayer.sequence, loadout, r.mobInitHP);
-        if (res.died) deathCount++;
-        damages.push(res.damage);
+        if (detailed.perSimDied[i]) deathCount++;
+        damages.push(detailed.perSimDamage[i]!);
         completionTicks.push(r.completedTick);
       }
       const deathPct = damages.length > 0 ? (deathCount / damages.length) * 100 : 0;
@@ -234,7 +236,7 @@ export async function startAutozuk(): Promise<void> {
         deathPct,
         markedDead: isMostlyDead || isMostlyInvalid,
       };
-      state.autozukResults[key] = tileResult;
+      state.autozukResults[tileIdx] = tileResult;
       playScoreBlip(avgDmg);
       updateLiveDetail(tile.x, tile.y, tileResult);
       const dmgRound = Math.round(avgDmg);
@@ -280,22 +282,23 @@ export async function startAutozuk(): Promise<void> {
   byId('phase1Panel').style.display = '';
 
   // Best tile
-  let bestKey: string | null = null;
+  let bestIdx = -1;
+  let bestResult: AutozukResult | undefined;
   let bestDmg = Infinity;
-  for (const key in state.autozukResults) {
-    const r = state.autozukResults[key]!;
-    if (r.avgDamage < bestDmg) {
+  for (let idx = 0; idx < state.autozukResults.length; idx++) {
+    const r = state.autozukResults[idx];
+    if (r && r.avgDamage < bestDmg) {
       bestDmg = r.avgDamage;
-      bestKey = key;
+      bestIdx = idx;
+      bestResult = r;
     }
   }
-  if (bestKey) {
-    const parts = bestKey.split(',').map(Number);
-    const bx = parts[0]!;
-    const by = parts[1]!;
+  if (bestIdx >= 0 && bestResult) {
+    const bx = (bestIdx >> 5) + ARENA_X_MIN;
+    const by = (bestIdx & (TILE_STRIDE - 1)) + ARENA_Y_MIN;
     state.selectedTile = { x: bx, y: by };
     state.playerPlacement = { x: bx, y: by };
-    state.activePrayerSeq = state.autozukResults[bestKey]!.prayer;
+    state.activePrayerSeq = bestResult.prayer;
     showTileDetail(bx, by, closeTileDetail);
     const scoreName = state.currentLoadout.isBloodBarrage ? 'max HP deficit' : 'dmg';
     byId('autozukStatus').textContent = `Done! Best tile: (${bx},${by}) — avg ${Math.round(bestDmg)} ${scoreName}`;
@@ -311,8 +314,9 @@ export async function startAutozuk(): Promise<void> {
 export function resetAutozuk(): void {
   if (state.autozukRunning) return;
   state.autozukMode = false;
-  state.autozukResults = {};
-  state.excludedTiles = new Set();
+  state.autozukResults = new Array(TILE_BUF_LEN);
+  state.excludedTiles = new Uint8Array(TILE_BUF_LEN);
+  state.excludedTilesCount = 0;
   state.selectedTile = null;
   state.activePrayerSeq = null;
   state.autozukHidden = false;

@@ -46,9 +46,13 @@ function mkMob(x: number, y: number, size = 1, overrides: Partial<Mob> = {}): Mo
     digLocation: null,
     hasFlicker: false,
     flickering: false,
-    incomingProjectiles: [],
+    projDelay: new Int8Array(16),
+    projDmg: new Int16Array(16),
+    projCount: 0,
     noLOSTicks: 0,
     currentStyle: null,
+    _gridCell: 0,
+    _parentRef: null,
     ...overrides,
   };
 }
@@ -63,6 +67,8 @@ const mkPlayer = (x: number, y: number): Player => ({
   attackDelay: 0,
   range: 6,
   atkSpeed: 5,
+  projDelays: new Int8Array(32),
+  projCount: 0,
   incomingProjectiles: [],
   autoRetaliate: true,
   lastHit: false,

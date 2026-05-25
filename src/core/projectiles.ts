@@ -37,9 +37,25 @@ export function monsterProjectileOrigin(mob: Mob): Tile {
   return { x: mob.x, y: mob.y };
 }
 
+// Allocation-free variant — computes the chebyshev distance directly without building
+// a Tile object. Hot path: called once per fired mob attack.
 export function monsterProjectileDistance(px: number, py: number, mob: Mob): number {
-  const o = monsterProjectileOrigin(mob);
-  return chebyshev(px, py, o.x, o.y);
+  let ox: number;
+  let oy: number;
+  const t = mob.type;
+  if (t === 'mager') {
+    ox = mob.x + 2;
+    oy = mob.y - 2;
+  } else if (t === 'ranger' || t === 'blob') {
+    ox = mob.x + 1;
+    oy = mob.y - 1;
+  } else {
+    ox = mob.x;
+    oy = mob.y;
+  }
+  const dx = px > ox ? px - ox : ox - px;
+  const dy = py > oy ? py - oy : oy - py;
+  return dx > dy ? dx : dy;
 }
 
 export function monsterProjectileDelay(mob: Mob, style: AttackStyle, player: Player): number {

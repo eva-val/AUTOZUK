@@ -56,7 +56,7 @@ describe('createMob', () => {
     expect(m.style).toBe(d.style);
     expect(m.dead).toBe(false);
     expect(m.dying).toBe(-1);
-    expect(m.incomingProjectiles).toEqual([]);
+    expect(m.projCount).toBe(0);
   });
 
   it('sets isBlob only for blob', () => {
@@ -156,6 +156,8 @@ function makeState(): SimState {
     aliveCount: 0,
     corpsesPending: 0,
     pendingDeathCount: 0,
+    mobGrid: new Int16Array(4096),
+    deadMobsHead: 0,
   };
 }
 

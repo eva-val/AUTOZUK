@@ -44,6 +44,8 @@ function makeState(mob: Mob, player: Player): SimState {
     aliveCount: 1,
     corpsesPending: 0,
     pendingDeathCount: 0,
+    mobGrid: new Int16Array(4096),
+    deadMobsHead: 0,
   };
 }
 

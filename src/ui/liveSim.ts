@@ -110,7 +110,7 @@ export function liveTick(): void {
       mob.frozen--;
       continue;
     }
-    moveMobStep(mob, player, region, mobs);
+    moveMobStep(mob, player, region, mobs, sim.mobGrid);
   }
 
   // Mob attacks

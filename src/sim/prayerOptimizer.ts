@@ -92,23 +92,41 @@ export interface PreparedSim {
   hasRecoil: boolean;
 }
 
-// Resolve atkStats per (mobType, style) lazily once per prepare call.
-function getStats(
-  loadout: Loadout,
-  cache: Map<number, { acc: number; maxPlus1: number } | null>,
-  mobType: MobType,
-  style: AttackStyle
-): { acc: number; maxPlus1: number } | null {
-  // Pack key: mobType as small int (string hash via Map key would alloc) — just use string.
-  // Keep an object cache keyed by `${mobType}|${style}` to avoid the resolveMonsterAttackStats
-  // shape-dispatch on every call.
+// Resolve atkStats per (mobType, style) lazily once per prepare call. Backed by flat
+// parallel arrays of length 36 (9 mob types × 4 styles) so we never hash a Map key in
+// the hot prepare loop. `cacheSeen[k]` indicates whether `cacheAcc[k]` / `cacheMax[k]`
+// have been populated for that key; the special `cacheNull[k]` flag distinguishes a
+// real null result from "not yet looked up".
+interface StatsCache {
+  seen: Uint8Array;
+  isNull: Uint8Array;
+  acc: Float64Array;
+  maxPlus1: Int32Array;
+}
+function makeStatsCache(): StatsCache {
+  return {
+    seen: new Uint8Array(36),
+    isNull: new Uint8Array(36),
+    acc: new Float64Array(36),
+    maxPlus1: new Int32Array(36),
+  };
+}
+function getStatsAcc(loadout: Loadout, cache: StatsCache, mobType: MobType, style: AttackStyle): number {
   const k = mobTypeStyleKey(mobType, style);
-  const cached = cache.get(k);
-  if (cached !== undefined) return cached;
-  const stats = resolveMonsterAttackStats(loadout, mobType, style);
-  const out = stats ? { acc: stats.acc, maxPlus1: stats.max + 1 } : null;
-  cache.set(k, out);
-  return out;
+  if (cache.seen[k] === 0) {
+    const stats = resolveMonsterAttackStats(loadout, mobType, style);
+    cache.seen[k] = 1;
+    if (stats) {
+      cache.acc[k] = stats.acc;
+      cache.maxPlus1[k] = stats.max + 1;
+    } else {
+      cache.isNull[k] = 1;
+    }
+  }
+  return cache.isNull[k] === 1 ? -1 : cache.acc[k]!;
+}
+function getStatsMaxPlus1(cache: StatsCache, mobType: MobType, style: AttackStyle): number {
+  return cache.maxPlus1[mobTypeStyleKey(mobType, style)]!;
 }
 
 // Pack (mobType, style) into a small integer. The set of mob types and styles is fixed
@@ -168,15 +186,22 @@ export function prepareSimDamage(
   mobInitHP: Record<number, { hp: number; type: MobType }>
 ): PreparedSim {
   const hasRecoil = loadout.hasRecoil === true && mobInitHP !== undefined;
+  // `for (const id in mobInitHP)` over a `Record<number, …>` iterates string keys and
+  // is dramatically slower than walking the attacks once. Build the max id directly
+  // from the attacks (which already include every mobId / targetMobId in play) and
+  // copy initial HP via Object.values to avoid the keyed-record-iteration cost.
   let maxId = -1;
-  for (const id in mobInitHP) {
-    const v = +id;
-    if (v > maxId) maxId = v;
-  }
-  // Also bound by max id appearing in attacks (bloblets spawned mid-sim show up there).
   for (const a of attacks) {
     if (a.mobId > maxId) maxId = a.mobId;
     if (a.targetMobId !== undefined && a.targetMobId > maxId) maxId = a.targetMobId;
+  }
+  // mobInitHP may carry ids that never appear in attacks (rare but possible). One pass
+  // over its enumerable own properties using the integer-coerced key keeps maxId
+  // upper-bounded correctly.
+  const initEntries = Object.keys(mobInitHP);
+  for (let i = 0; i < initEntries.length; i++) {
+    const v = +initEntries[i]!;
+    if (v > maxId) maxId = v;
   }
   const maxIdPlus1 = maxId + 1;
   const initialMobHP = new Int32Array(maxIdPlus1);
@@ -184,10 +209,13 @@ export function prepareSimDamage(
     // Sentinel: -1 indicates the id was never seen in mobInitHP (e.g. an id that only
     // appears as a target via revive). The hot loop checks against >= 0 before applying.
     initialMobHP.fill(-1);
-    for (const id in mobInitHP) initialMobHP[+id] = mobInitHP[+id]!.hp;
+    for (let i = 0; i < initEntries.length; i++) {
+      const k = initEntries[i]!;
+      initialMobHP[+k] = mobInitHP[+k]!.hp;
+    }
   }
 
-  const statsCache = new Map<number, { acc: number; maxPlus1: number } | null>();
+  const statsCache = makeStatsCache();
   const events: Prepared[] = new Array(attacks.length);
   for (let i = 0; i < attacks.length; i++) {
     const atk = attacks[i]!;
@@ -224,12 +252,12 @@ export function prepareSimDamage(
     const recoilTick = (atk.hitTick !== undefined ? atk.hitTick : atk.tick + 1) + 1;
     if (atk.style !== null) {
       // Fixed style — fully precompute hit and damage.
-      const stats = getStats(loadout, statsCache, atk.mobType, atk.style);
+      const acc = getStatsAcc(loadout, statsCache, atk.mobType, atk.style);
       let hit = false;
       let dmg = 0;
-      if (stats) {
-        hit = atk.accRoll < stats.acc;
-        if (hit) dmg = Math.floor(atk.dmgRoll * stats.maxPlus1);
+      if (acc >= 0) {
+        hit = atk.accRoll < acc;
+        if (hit) dmg = Math.floor(atk.dmgRoll * getStatsMaxPlus1(statsCache, atk.mobType, atk.style));
       }
       const ringDmg = dmg > 0 ? Math.floor(dmg * 0.1 + 1) : 0;
       events[i] = {
@@ -248,19 +276,19 @@ export function prepareSimDamage(
     } else {
       // Blob attack — atkStyle depends on prayer at scanTick & 3.
       const scanTickMod4 = atk.scanTick & 3;
-      const magStats = getStats(loadout, statsCache, atk.mobType, 'magic');
-      const rngStats = getStats(loadout, statsCache, atk.mobType, 'range');
+      const magAcc = getStatsAcc(loadout, statsCache, atk.mobType, 'magic');
+      const rngAcc = getStatsAcc(loadout, statsCache, atk.mobType, 'range');
       let hitMag = false;
       let dmgMag = 0;
-      if (magStats) {
-        hitMag = atk.accRoll < magStats.acc;
-        if (hitMag) dmgMag = Math.floor(atk.dmgRoll * magStats.maxPlus1);
+      if (magAcc >= 0) {
+        hitMag = atk.accRoll < magAcc;
+        if (hitMag) dmgMag = Math.floor(atk.dmgRoll * getStatsMaxPlus1(statsCache, atk.mobType, 'magic'));
       }
       let hitRng = false;
       let dmgRng = 0;
-      if (rngStats) {
-        hitRng = atk.accRoll < rngStats.acc;
-        if (hitRng) dmgRng = Math.floor(atk.dmgRoll * rngStats.maxPlus1);
+      if (rngAcc >= 0) {
+        hitRng = atk.accRoll < rngAcc;
+        if (hitRng) dmgRng = Math.floor(atk.dmgRoll * getStatsMaxPlus1(statsCache, atk.mobType, 'range'));
       }
       events[i] = {
         kind: AKind.RegularBlob,
@@ -337,14 +365,19 @@ export function applyPrayer(prepared: PreparedSim, prayerSeq: PrayerSequence, lo
   let nMR = 0; // pendingMobRemovals length
   let nRC = 0; // pendingRecoil length
   if (hasRecoil) {
-    SC_playerHitTick = ensureCap(SC_playerHitTick, 32);
-    SC_playerHitMobId = ensureCap(SC_playerHitMobId, 32);
-    SC_playerHitDmg = ensureCap(SC_playerHitDmg, 32);
-    SC_mobRmTick = ensureCap(SC_mobRmTick, 32);
-    SC_mobRmMobId = ensureCap(SC_mobRmMobId, 32);
-    SC_recoilTick = ensureCap(SC_recoilTick, 32);
-    SC_recoilMobId = ensureCap(SC_recoilMobId, 32);
-    SC_recoilDmg = ensureCap(SC_recoilDmg, 32);
+    // Pre-size every scratch to a bound that fits the whole sim. Player hits and
+    // mob removals are capped by the event count; recoil entries are bounded by
+    // events.length × 2 (one ring + one echo per damaging mob hit). After this
+    // single allocation pass, the per-push ensureCap checks become unnecessary.
+    const ePlus = events.length + 1;
+    SC_playerHitTick = ensureCap(SC_playerHitTick, ePlus);
+    SC_playerHitMobId = ensureCap(SC_playerHitMobId, ePlus);
+    SC_playerHitDmg = ensureCap(SC_playerHitDmg, ePlus);
+    SC_mobRmTick = ensureCap(SC_mobRmTick, ePlus);
+    SC_mobRmMobId = ensureCap(SC_mobRmMobId, ePlus);
+    SC_recoilTick = ensureCap(SC_recoilTick, ePlus * 2);
+    SC_recoilMobId = ensureCap(SC_recoilMobId, ePlus * 2);
+    SC_recoilDmg = ensureCap(SC_recoilDmg, ePlus * 2);
   }
   let echoBootsCooldown = 0;
 
@@ -377,8 +410,6 @@ export function applyPrayer(prepared: PreparedSim, prayerSeq: PrayerSequence, lo
         return;
       }
     }
-    SC_mobRmTick = ensureCap(SC_mobRmTick, nMR + 1);
-    SC_mobRmMobId = ensureCap(SC_mobRmMobId, nMR + 1);
     SC_mobRmTick[nMR] = removeTick;
     SC_mobRmMobId[nMR] = mobId;
     nMR++;
@@ -419,9 +450,6 @@ export function applyPrayer(prepared: PreparedSim, prayerSeq: PrayerSequence, lo
         e.targetMobId < maxIdPlus1 &&
         prepared.initialMobHP[e.targetMobId]! !== -1
       ) {
-        SC_playerHitTick = ensureCap(SC_playerHitTick, nPH + 1);
-        SC_playerHitMobId = ensureCap(SC_playerHitMobId, nPH + 1);
-        SC_playerHitDmg = ensureCap(SC_playerHitDmg, nPH + 1);
         SC_playerHitTick[nPH] = e.hitTick;
         SC_playerHitMobId[nPH] = e.targetMobId;
         SC_playerHitDmg[nPH] = e.playerDmg;
@@ -527,17 +555,11 @@ export function applyPrayer(prepared: PreparedSim, prayerSeq: PrayerSequence, lo
       if (hp < minHp) minHp = hp;
       if (hasRecoil) {
         const recoilTick = e.recoilTick;
-        SC_recoilTick = ensureCap(SC_recoilTick, nRC + 1);
-        SC_recoilMobId = ensureCap(SC_recoilMobId, nRC + 1);
-        SC_recoilDmg = ensureCap(SC_recoilDmg, nRC + 1);
         SC_recoilTick[nRC] = recoilTick;
         SC_recoilMobId[nRC] = e.mobId;
         SC_recoilDmg[nRC] = ringDmg;
         nRC++;
         if (e.echoEligible && recoilTick >= echoBootsCooldown) {
-          SC_recoilTick = ensureCap(SC_recoilTick, nRC + 1);
-          SC_recoilMobId = ensureCap(SC_recoilMobId, nRC + 1);
-          SC_recoilDmg = ensureCap(SC_recoilDmg, nRC + 1);
           SC_recoilTick[nRC] = recoilTick;
           SC_recoilMobId[nRC] = e.mobId;
           SC_recoilDmg[nRC] = 1;

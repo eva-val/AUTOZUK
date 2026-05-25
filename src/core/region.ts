@@ -46,10 +46,10 @@ export function createRegion(pillarConfig: PillarConfig): Region {
   return { entities, pillars: p2, blocked };
 }
 
-export function findRespawnLocation(size: number, region: Region, mobs: Mob[]): Tile {
+export function findRespawnLocation(size: number, region: Region, mobs: Mob[], grid?: Int16Array): Tile {
   for (let x = 16; x < 23; x++) {
     for (let y = 11; y < 24; y++) {
-      if (!collidesWithMobs(x, y, size, mobs, null) && !collidesWithEntities(x, y, size, region.entities))
+      if (!collidesWithMobs(x, y, size, mobs, null, false, grid) && !collidesWithEntities(x, y, size, region.entities))
         return { x, y };
     }
   }

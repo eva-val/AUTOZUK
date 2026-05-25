@@ -35,9 +35,13 @@ const FAKE_TARGET: Mob = {
   digLocation: null,
   hasFlicker: false,
   flickering: false,
-  incomingProjectiles: [],
+  projDelay: new Int8Array(16),
+  projDmg: new Int16Array(16),
+  projCount: 0,
   noLOSTicks: 0,
   currentStyle: null,
+  _gridCell: 0,
+  _parentRef: null,
 };
 
 // Scratch big-mob shape used for the size>1 melee-range check inside the LOS branch below.

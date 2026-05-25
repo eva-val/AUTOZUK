@@ -1,4 +1,4 @@
-import { distToMob } from '../core/geometry';
+import { clearMobFromGrid, distToMob, MOB_GRID_SIZE, stampMobOnGrid } from '../core/geometry';
 import { canUseSecondaryMelee, isUnderMob, isWithinMeleeRange, mobHasLOS, playerHasLOS } from '../core/los';
 import {
   applySpawnList,
@@ -44,7 +44,11 @@ export function initSimState(
   const region = cachedRegion ?? createRegion(pillarConfig);
   const parsed = parseSpawnCode(spawnCode);
   if (isSpawnCodeError(parsed)) return null;
+  const mobGrid = new Int16Array(MOB_GRID_SIZE);
   const { mobs, idCounter } = applySpawnList(parsed.spawns, parsed.hasIndexInfo, 0);
+  // Stamp the initial mob footprints into the occupancy grid. Subsequent moves/deaths/
+  // revives keep the grid in sync via clearMobFromGrid / stampMobOnGrid.
+  for (const m of mobs) stampMobOnGrid(mobGrid, m);
   let nextId = idCounter;
   const allPillarsDead = !pillarConfig.S && !pillarConfig.W && !pillarConfig.N;
   if (allPillarsDead) {
@@ -52,7 +56,8 @@ export function initSimState(
       mobs,
       region,
       (t, x, y, id) => createMob(t, x, y, id),
-      () => nextId++
+      () => nextId++,
+      mobGrid
     );
   }
   const player = createPlayer(playerPos.x, playerPos.y, loadout);
@@ -78,6 +83,8 @@ export function initSimState(
     aliveCount: mobs.length,
     corpsesPending: 0,
     pendingDeathCount: 0,
+    mobGrid,
+    deadMobsHead: 0,
   };
 }
 
@@ -110,6 +117,7 @@ export function processPendingMobDeaths(state: SimState, tick: number): void {
 
 export function spawnBlobletsFromBlob(blob: Mob, state: SimState): Mob[] {
   const mobs = state.mobs;
+  const grid = state.mobGrid;
   const bm = createMob('blobletMage', blob.x + 2, blob.y - 2, state.idCounter++);
   const br = createMob('blobletRange', blob.x + 1, blob.y - 1, state.idCounter++);
   const bx = createMob('blobletMelee', blob.x, blob.y, state.idCounter++);
@@ -119,7 +127,13 @@ export function spawnBlobletsFromBlob(blob: Mob, state: SimState): Mob[] {
     bl.frozen = 1;
     bl.attackDelay = 4;
     bl.parentBlobId = blob.id;
+    bl._parentRef = blob;
+    bl._gridCell = mobs.length + 1;
     mobs.push(bl);
+    // Stamp the bloblet over the parent's still-dying footprint cell. When this bloblet
+    // later moves or dies, clearMobFromGrid will restamp the parent on the now-empty
+    // cell (so the parent's logical presence is preserved until its corpse expires).
+    stampMobOnGrid(grid, bl);
     state.mobInitHP[bl.id] = { hp: bl.hp, type: bl.type };
     state.mobMap.set(bl.id, bl);
     state.aliveCount++;
@@ -173,15 +187,24 @@ export function fireMobAttack(
   const edgeDist = distToMob(player.x, player.y, mob);
   const accRoll = Math.random();
   const dmgRoll = Math.random();
-  player.incomingProjectiles.push({
-    delay: delay + 1,
-    damage: 0,
-    mobType: mob.type,
-    mobId: mob.id,
-    style: projectileStyle,
-    fireTick: tick,
-  });
+  // Headless mode only needs the delay; live mode still records the full object so
+  // applyMobProjectilesLanding can match back to the corresponding AttackEvent later.
+  if (state.recordMode === 'headless') {
+    player.projDelays[player.projCount] = delay + 1;
+    player.projCount++;
+  } else {
+    player.incomingProjectiles.push({
+      delay: delay + 1,
+      damage: 0,
+      mobType: mob.type,
+      mobId: mob.id,
+      style: projectileStyle,
+      fireTick: tick,
+    });
+  }
   setPlayerLastAttacker(player, mob);
+  // All AttackEvent literals share one key set so V8 keeps them under a single hidden
+  // class. Inapplicable fields are explicitly set to undefined rather than omitted.
   const event: AttackEvent = {
     tick,
     mobId: mob.id,
@@ -193,6 +216,12 @@ export function fireMobAttack(
     dmgRoll,
     distAtFire: edgeDist,
     hitTick: tick + delay,
+    isPlayerAttack: undefined,
+    playerDmg: undefined,
+    targetMobId: undefined,
+    targetMobType: undefined,
+    isRevive: undefined,
+    reviveHp: undefined,
   };
   state.attacks.push(event);
   return event;
@@ -223,6 +252,14 @@ export function blobScan(
     scanTick: tick,
     accRoll: 0,
     dmgRoll: 0,
+    distAtFire: undefined,
+    hitTick: undefined,
+    isPlayerAttack: undefined,
+    playerDmg: undefined,
+    targetMobId: undefined,
+    targetMobType: undefined,
+    isRevive: undefined,
+    reviveHp: undefined,
   };
   state.attacks.push(event);
   return { event, style };
@@ -234,8 +271,9 @@ export interface ReviveResult {
 }
 
 export function tryReviveMobFromMager(mob: Mob, state: SimState): ReviveResult | null {
-  if (Math.random() >= 0.1 || state.deadMobs.length === 0) return null;
-  const toRes = state.deadMobs.shift()!;
+  if (Math.random() >= 0.1 || state.deadMobsHead >= state.deadMobs.length) return null;
+  // Pop via head index instead of Array.shift (O(N)).
+  const toRes = state.deadMobs[state.deadMobsHead++]!;
   const wasDead = toRes.dead;
   const wasDying = toRes.dying;
   const hadPending = toRes.pendingRemovalTick !== undefined;
@@ -249,11 +287,22 @@ export function tryReviveMobFromMager(mob: Mob, state: SimState): ReviveResult |
   toRes.attackDelay = toRes.atkSpeed + 1;
   toRes.stunned = 0;
   toRes.frozen = 0;
-  const loc = findRespawnLocation(toRes.size, state.region, state.mobs);
+  // findRespawnLocation must see toRes as still occupying its OLD footprint — the
+  // pre-refactor linear scan does that implicitly because toRes.x/y haven't been
+  // updated yet. If toRes was fully dead, processCorpseExpiry already cleared its
+  // grid stamp; restamp it temporarily so the grid lookup matches the linear scan.
+  const grid = state.mobGrid;
+  if (wasDead) stampMobOnGrid(grid, toRes);
+  const loc = findRespawnLocation(toRes.size, state.region, state.mobs, grid);
+  clearMobFromGrid(grid, toRes);
   toRes.x = loc.x;
   toRes.y = loc.y;
   toRes.aggroTarget = 'player';
-  if (!state.mobs.includes(toRes)) state.mobs.push(toRes);
+  if (!state.mobs.includes(toRes)) {
+    toRes._gridCell = state.mobs.length + 1;
+    state.mobs.push(toRes);
+  }
+  stampMobOnGrid(grid, toRes);
   if (wasDead) state.aliveCount++;
   if (wasDying > 0) state.corpsesPending--;
   if (hadPending) state.pendingDeathCount--;
@@ -267,6 +316,12 @@ export function tryReviveMobFromMager(mob: Mob, state: SimState): ReviveResult |
     scanTick: -1,
     accRoll: 0,
     dmgRoll: 0,
+    distAtFire: undefined,
+    hitTick: undefined,
+    isPlayerAttack: undefined,
+    playerDmg: undefined,
+    targetMobId: undefined,
+    targetMobType: undefined,
     isRevive: true,
     reviveHp,
   };
@@ -391,7 +446,9 @@ export function playerAttackStep(state: SimState, tick: number): PlayerAttackOut
   } else {
     player.lastHit = false;
   }
-  target.incomingProjectiles.push({ delay, damage: dmg });
+  target.projDelay[target.projCount] = delay;
+  target.projDmg[target.projCount] = dmg;
+  target.projCount++;
   const primaryEvent: AttackEvent = {
     tick,
     mobId: target.id,
@@ -401,11 +458,14 @@ export function playerAttackStep(state: SimState, tick: number): PlayerAttackOut
     scanTick: -1,
     accRoll: 0,
     dmgRoll: 0,
+    distAtFire: undefined,
+    hitTick: tick + delay,
     isPlayerAttack: true,
     playerDmg: dmg,
     targetMobId: target.id,
     targetMobType: target.type,
-    hitTick: tick + delay,
+    isRevive: undefined,
+    reviveHp: undefined,
   };
   state.attacks.push(primaryEvent);
   events.push(primaryEvent);
@@ -427,7 +487,9 @@ export function playerAttackStep(state: SimState, tick: number): PlayerAttackOut
           const sHit = Math.random() < sAcc;
           const sDmg = sHit ? Math.floor(Math.random() * (loadout.maxHit + 1)) : 0;
           const sDelay = playerProjectileDelay(loadout, player.x, player.y, m);
-          m.incomingProjectiles.push({ delay: sDelay, damage: sDmg });
+          m.projDelay[m.projCount] = sDelay;
+          m.projDmg[m.projCount] = sDmg;
+          m.projCount++;
           if (sDmg > 0 && player.hp < player.maxHp) {
             player.hp = Math.min(player.maxHp, player.hp + Math.floor(sDmg * 0.25));
           }
@@ -440,11 +502,14 @@ export function playerAttackStep(state: SimState, tick: number): PlayerAttackOut
             scanTick: -1,
             accRoll: 0,
             dmgRoll: 0,
+            distAtFire: undefined,
+            hitTick: tick + sDelay,
             isPlayerAttack: true,
             playerDmg: sDmg,
             targetMobId: m.id,
             targetMobType: m.type,
-            hitTick: tick + sDelay,
+            isRevive: undefined,
+            reviveHp: undefined,
           };
           state.attacks.push(splashEvent);
           events.push(splashEvent);
@@ -459,42 +524,52 @@ export function playerAttackStep(state: SimState, tick: number): PlayerAttackOut
 }
 
 // Apply player attack projectiles landing on mobs. Mirrors the original processIncomingProjectiles.
+// SoA typed-array form: walk projDelay/projDmg up to projCount, decrement delays, apply landed
+// damage, compact in place to drop landed entries.
 export function processMobIncomingProjectiles(state: SimState, tick: number): void {
   for (const mob of state.mobs) {
     if (mob.dead || mob.dying > 0) continue;
-    const arr = mob.incomingProjectiles;
-    if (arr.length === 0) continue;
+    const n = mob.projCount;
+    if (n === 0) continue;
+    const delays = mob.projDelay;
+    const dmgs = mob.projDmg;
     let w = 0;
-    for (let r = 0; r < arr.length; r++) {
-      const p = arr[r]!;
-      p.delay--;
-      if (p.delay <= 0) {
+    for (let r = 0; r < n; r++) {
+      const d = delays[r]! - 1;
+      if (d <= 0) {
         if (mob.pendingRemovalTick === undefined) {
-          mob.hp -= p.damage;
+          mob.hp -= dmgs[r]!;
           if (mob.hp <= 0) markMobForProjectileRemoval(mob, tick, state);
         }
       } else {
-        arr[w++] = p;
+        delays[w] = d;
+        dmgs[w] = dmgs[r]!;
+        w++;
       }
     }
-    arr.length = w;
+    mob.projCount = w;
   }
 }
 
-// Process mob projectiles landing on player (headless: just drain; live wrapper applies damage).
-// Returns whether any projectiles arrived this tick (used for auto-retaliate).
+// Process mob projectiles landing on player. Headless mode only needs to know whether
+// anything arrived (auto-retaliate gate). Walk the packed Int8Array, decrement delays,
+// compact in place to drop landed entries.
 export function drainPlayerIncomingProjectiles(state: SimState): boolean {
-  const arr = state.player.incomingProjectiles;
-  if (arr.length === 0) return false;
+  const player = state.player;
+  const n = player.projCount;
+  if (n === 0) return false;
+  const delays = player.projDelays;
   let w = 0;
   let anyArrived = false;
-  for (let r = 0; r < arr.length; r++) {
-    const p = arr[r]!;
-    p.delay--;
-    if (p.delay <= 0) anyArrived = true;
-    else arr[w++] = p;
+  for (let r = 0; r < n; r++) {
+    const d = delays[r]! - 1;
+    if (d <= 0) anyArrived = true;
+    else {
+      delays[w] = d;
+      w++;
+    }
   }
-  arr.length = w;
+  player.projCount = w;
   return anyArrived;
 }
 
@@ -520,7 +595,12 @@ export function headlessTick(state: SimState): void {
   processCorpseExpiry(state, tick);
   processPendingMobDeaths(state, tick);
   processDelayedBlobletSpawns(state, tick);
-  for (const mob of state.mobs) {
+  const mobs = state.mobs;
+  const player = state.player;
+  const region = state.region;
+  const grid = state.mobGrid;
+  for (let i = 0; i < mobs.length; i++) {
+    const mob = mobs[i]!;
     if (mob.dead || mob.dying > 0) continue;
     if (mob.stunned > 0) {
       mob.stunned--;
@@ -530,17 +610,43 @@ export function headlessTick(state: SimState): void {
       mob.frozen--;
       continue;
     }
-    moveMobStep(mob, state.player, state.region, state.mobs);
+    moveMobStep(mob, player, region, mobs, grid);
   }
-  for (const mob of state.mobs) {
-    if (mob.dead || mob.dying > 0 || mob.stunned > 0) continue;
-    mob.attackDelay--;
-    mobAttackStep(mob, state, tick);
+  // Fused attack + incoming-projectile pass. Original code ran two sequential loops
+  // over state.mobs (attack, then process projectiles). Both pass through the same
+  // live-mob filter, so we merge to halve the iteration cost. Stunned mobs still
+  // process projectiles but skip the attack step (matches the original filters).
+  for (let i = 0; i < mobs.length; i++) {
+    const mob = mobs[i]!;
+    if (mob.dead || mob.dying > 0) continue;
+    if (mob.stunned === 0) {
+      mob.attackDelay--;
+      mobAttackStep(mob, state, tick);
+    }
+    const n = mob.projCount;
+    if (n !== 0) {
+      const delays = mob.projDelay;
+      const dmgs = mob.projDmg;
+      let w = 0;
+      for (let r = 0; r < n; r++) {
+        const d = delays[r]! - 1;
+        if (d <= 0) {
+          if (mob.pendingRemovalTick === undefined) {
+            mob.hp -= dmgs[r]!;
+            if (mob.hp <= 0) markMobForProjectileRemoval(mob, tick, state);
+          }
+        } else {
+          delays[w] = d;
+          dmgs[w] = dmgs[r]!;
+          w++;
+        }
+      }
+      mob.projCount = w;
+    }
   }
-  processMobIncomingProjectiles(state, tick);
   const anyArrived = drainPlayerIncomingProjectiles(state);
   applyAutoRetaliate(state, tick, anyArrived);
-  state.player.attackDelay--;
+  player.attackDelay--;
   movePlayerStep(state);
   playerAttackStep(state, tick);
 }

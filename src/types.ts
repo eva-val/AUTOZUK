@@ -91,7 +91,12 @@ export interface Mob {
   digLocation: Tile | null;
   hasFlicker: boolean;
   flickering: boolean;
-  incomingProjectiles: IncomingMobProjectile[];
+  // Player-fired projectiles incoming to this mob. SoA typed-array representation:
+  // projDelay[i] is the remaining tick count, projDmg[i] is the damage to apply when
+  // delay reaches 0. Cap 16 — atk speeds (2–5) × max delay (5) leave plenty of slack.
+  projDelay: Int8Array;
+  projDmg: Int16Array;
+  projCount: number;
   noLOSTicks: number;
   currentStyle: AttackStyle | null;
   infNum?: number;
@@ -103,6 +108,13 @@ export interface Mob {
   // mobAttackStep call after moveMobStep when the mob hasn't moved.
   _losCacheKey?: number;
   _losCacheValue?: boolean;
+  // Mob occupancy grid handle: 1-based index into state.mobs (0 = not yet placed).
+  // Read by stampMobOnGrid / clearMobFromGrid and the fast path of collidesWithMobs.
+  _gridCell: number;
+  // Direct reference to the parent blob (only set on bloblets). Used by clearMobFromGrid
+  // to restamp the parent's footprint when a child vacates a cell during the parent's
+  // dying window, so the parent's logical presence isn't lost from the grid.
+  _parentRef: Mob | null;
 }
 
 export interface Player {
@@ -115,6 +127,12 @@ export interface Player {
   attackDelay: number;
   range: number;
   atkSpeed: number;
+  // Headless mode skips the per-projectile object and just records remaining delays;
+  // drainPlayerIncomingProjectiles only needs to know whether anything landed this tick.
+  // Live mode still uses incomingProjectiles because applyMobProjectilesLanding needs
+  // the full metadata (mobId / style / fireTick) to resolve the matching AttackEvent.
+  projDelays: Int8Array;
+  projCount: number;
   incomingProjectiles: IncomingPlayerProjectile[];
   autoRetaliate: boolean;
   lastHit: boolean;
@@ -230,6 +248,9 @@ export interface SimState {
   aliveCount: number;
   corpsesPending: number;
   pendingDeathCount: number;
+  mobGrid: Int16Array;
+  // tryReviveMobFromMager pops at deadMobs[deadMobsHead] instead of shifting (O(1)).
+  deadMobsHead: number;
 }
 
 export type TickEventKind =

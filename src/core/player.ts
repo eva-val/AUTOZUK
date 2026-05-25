@@ -11,6 +11,8 @@ export function createPlayer(x: number, y: number, loadout: Loadout): Player {
     attackDelay: 0,
     range: loadout.range,
     atkSpeed: loadout.atkSpeed,
+    projDelays: new Int8Array(32),
+    projCount: 0,
     incomingProjectiles: [],
     autoRetaliate: true,
     lastHit: true,

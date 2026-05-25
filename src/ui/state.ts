@@ -17,8 +17,7 @@ import type {
 // covers ARENA_H = 30 with room to spare.
 export const TILE_STRIDE = 32;
 export const TILE_BUF_LEN = ARENA_W * TILE_STRIDE;
-export const packTile = (x: number, y: number): number =>
-  ((x - ARENA_X_MIN) << 5) | (y - ARENA_Y_MIN);
+export const packTile = (x: number, y: number): number => ((x - ARENA_X_MIN) << 5) | (y - ARENA_Y_MIN);
 
 // All formerly-global UI state lives here as a single mutable singleton.
 // The sim engine never imports from this file — UI controllers read/write it directly.

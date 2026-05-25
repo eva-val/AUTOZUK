@@ -39,6 +39,20 @@ function plainFont(px: number): string {
   return s;
 }
 
+// RAF-coalesced render scheduler. Hot callers (the AUTOZUK loop) can fire scheduleRender()
+// freely; multiple calls in one frame collapse to a single render. Synchronous render()
+// is still exported for one-shots where the caller needs the canvas updated before
+// returning to the user (resize, reset, user click).
+let _renderPending = false;
+export function scheduleRender(): void {
+  if (_renderPending) return;
+  _renderPending = true;
+  requestAnimationFrame(() => {
+    _renderPending = false;
+    render();
+  });
+}
+
 // Cached offscreen canvas for the static floor + grid. Re-built on tile-size change.
 let _floorBg: HTMLCanvasElement | null = null;
 let _floorBgTile = -1;

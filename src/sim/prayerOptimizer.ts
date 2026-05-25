@@ -723,12 +723,7 @@ export function optimizePrayerDetailed(
 
   // Reusable working buffer (length 4) — mutated per combo to avoid per-iteration
   // array allocations. `bestSeq` is copied out only when we find a new best.
-  const workSeq: PrayerSequence = [
-    slots[0] ?? 'mage',
-    slots[1] ?? 'mage',
-    slots[2] ?? 'mage',
-    slots[3] ?? 'mage',
-  ];
+  const workSeq: PrayerSequence = [slots[0] ?? 'mage', slots[1] ?? 'mage', slots[2] ?? 'mage', slots[3] ?? 'mage'];
   // Scratch + best per-sim buffers for damage/died. We write into `scratch*` per combo
   // and swap pointers with `best*` whenever a combo becomes the new minimum, avoiding
   // any copy on improvement.

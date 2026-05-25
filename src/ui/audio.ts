@@ -9,7 +9,17 @@ function ensureAudio(): AudioContext {
   return audioCtx;
 }
 
+// Per-blip-kind min gap. When AUTOZUK runs fast, hundreds of blips per second would
+// stack into noise; dropping calls within MIN_GAP_MS keeps audio crisp and audible
+// without queuing or summarisation.
+const MIN_GAP_MS = 50;
+let lastExclusionAt = 0;
+let lastScoreAt = 0;
+
 export function playExclusionBlip(): void {
+  const now = performance.now();
+  if (now - lastExclusionAt < MIN_GAP_MS) return;
+  lastExclusionAt = now;
   const ac = ensureAudio();
   const t = ac.currentTime;
   const osc = ac.createOscillator();
@@ -26,6 +36,9 @@ export function playExclusionBlip(): void {
 }
 
 export function playScoreBlip(avgDmg: number): void {
+  const now = performance.now();
+  if (now - lastScoreAt < MIN_GAP_MS) return;
+  lastScoreAt = now;
   const ac = ensureAudio();
   const t = ac.currentTime;
   const osc = ac.createOscillator();

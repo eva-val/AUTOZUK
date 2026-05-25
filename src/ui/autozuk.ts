@@ -2,7 +2,6 @@ import { createRegion } from '../core/region';
 import { isSpawnCodeError, parseSpawnCode } from '../core/spawnCode';
 import { ARENA_X_MAX, ARENA_X_MIN, ARENA_Y_MAX, ARENA_Y_MIN } from '../data/arena';
 import { MOB_DEFS } from '../data/mobs';
-import { initSimState } from '../sim/engine';
 import { checkTileExcluded } from '../sim/exclusion';
 import { runHeadlessSim } from '../sim/headless';
 import { optimizePrayerDetailed, type PreparedSim } from '../sim/prayerOptimizer';
@@ -11,12 +10,49 @@ import { playExclusionBlip, playScoreBlip } from './audio';
 import { updatePreview } from './controls';
 import { byId } from './dom';
 import { heatmapColor } from './heatmap';
-import { liveTick, stopPlay, updateLiveUI } from './liveSim';
-import { render } from './render';
+import { stopPlay, updateLiveUI } from './liveSim';
+import { render, scheduleRender } from './render';
 import { TILE_BUF_LEN, TILE_STRIDE, packTile, state } from './state';
 import { closeTileDetail, showTileDetail, updateLiveDetail } from './tileDetail';
 
 const PRAYER_LABELS = { mage: 'M', range: 'R', melee: 'X' } as const;
+
+// AUTOZUK DOM coalescer. When the per-tile loop fires faster than the browser can
+// paint, queue mutations and flush them in a single RAF tick. Each field keeps only
+// the latest value (rows are an exception — they need to all reach the DOM in order).
+let _pendingRows: HTMLDivElement[] = [];
+let _pendingDetail: { x: number; y: number; result: AutozukResult } | null = null;
+let _pendingProgressPct = -1;
+let _pendingStatusText: string | null = null;
+let _autozukFlushScheduled = false;
+function scheduleAutozukUiFlush(): void {
+  if (_autozukFlushScheduled) return;
+  _autozukFlushScheduled = true;
+  requestAnimationFrame(() => {
+    _autozukFlushScheduled = false;
+    if (_pendingProgressPct >= 0) {
+      byId<HTMLElement>('progressFill').style.width = `${_pendingProgressPct}%`;
+      _pendingProgressPct = -1;
+    }
+    if (_pendingStatusText !== null) {
+      byId('autozukStatus').textContent = _pendingStatusText;
+      _pendingStatusText = null;
+    }
+    if (_pendingRows.length > 0) {
+      const feedPanel = byId('liveFeedPanel');
+      const frag = document.createDocumentFragment();
+      for (const row of _pendingRows) frag.appendChild(row);
+      _pendingRows = [];
+      feedPanel.appendChild(frag);
+      feedPanel.scrollTop = feedPanel.scrollHeight;
+    }
+    if (_pendingDetail) {
+      const d = _pendingDetail;
+      _pendingDetail = null;
+      updateLiveDetail(d.x, d.y, d.result);
+    }
+  });
+}
 
 function setStatus(msg: string, type?: 'info' | 'error'): void {
   const el = byId('statusMsg');
@@ -94,39 +130,31 @@ export async function startAutozuk(): Promise<void> {
     }));
   const testRegion = createRegion(state.pillars);
 
-  // STEP 1: exclusion sweep (animated batches)
+  // STEP 1: exclusion sweep. The arena is ~870 tiles and each checkTileExcluded call
+  // is sub-millisecond, so the whole sweep runs synchronously in one tick. The previous
+  // 20-tile / 100ms animated batching added ~4s of artificial wall-clock delay and is
+  // a hard cap once the rest of the pipeline is fast. The exclusion blip is already
+  // rate-limited by audio.ts so synchronous calls produce at most a couple of audible
+  // hits, not a buzzsaw.
   byId('autozukStatus').textContent = 'Phase 1: Excluding tiles...';
-  const allTiles: Tile[] = [];
-  for (let y = ARENA_Y_MIN; y <= ARENA_Y_MAX; y++)
-    for (let x = ARENA_X_MIN; x <= ARENA_X_MAX; x++) allTiles.push({ x, y });
-
   const eligibleTiles: Tile[] = [];
-  let exIdx = 0;
-  await new Promise<void>((resolve) => {
-    function sweepBatch(): void {
-      let count = 0;
-      while (exIdx < allTiles.length && count < 20) {
-        const t = allTiles[exIdx]!;
-        if (checkTileExcluded(t.x, t.y, testMobs, testRegion)) {
-          state.excludedTiles[packTile(t.x, t.y)] = 1;
-          state.excludedTilesCount++;
-          playExclusionBlip();
-        } else {
-          eligibleTiles.push(t);
-        }
-        exIdx++;
-        count++;
+  let totalChecked = 0;
+  for (let y = ARENA_Y_MIN; y <= ARENA_Y_MAX; y++) {
+    for (let x = ARENA_X_MIN; x <= ARENA_X_MAX; x++) {
+      totalChecked++;
+      if (checkTileExcluded(x, y, testMobs, testRegion)) {
+        state.excludedTiles[packTile(x, y)] = 1;
+        state.excludedTilesCount++;
+        playExclusionBlip();
+      } else {
+        eligibleTiles.push({ x, y });
       }
-      const pct = Math.floor((exIdx / allTiles.length) * 100);
-      byId<HTMLElement>('progressFill').style.width = `${pct * 0.2}%`;
-      byId('autozukStatus').textContent =
-        `Excluding: ${exIdx}/${allTiles.length} tiles checked, ${eligibleTiles.length} eligible`;
-      render();
-      if (exIdx < allTiles.length) setTimeout(sweepBatch, 100);
-      else resolve();
     }
-    sweepBatch();
-  });
+  }
+  _pendingProgressPct = 20;
+  _pendingStatusText = `Excluding: ${totalChecked}/${totalChecked} tiles checked, ${eligibleTiles.length} eligible`;
+  scheduleAutozukUiFlush();
+  scheduleRender();
 
   setStatus(`${eligibleTiles.length} tiles to simulate, ${state.excludedTilesCount} excluded`, 'info');
 
@@ -137,37 +165,12 @@ export async function startAutozuk(): Promise<void> {
   for (let ti = 0; ti < totalTiles; ti++) {
     const tile = eligibleTiles[ti]!;
     const tileIdx = packTile(tile.x, tile.y);
-    byId('autozukStatus').textContent = `Simulating tile ${ti + 1}/${totalTiles} (${tile.x},${tile.y})...`;
+    _pendingStatusText = `Simulating tile ${ti + 1}/${totalTiles} (${tile.x},${tile.y})...`;
+    scheduleAutozukUiFlush();
 
-    // Quick live preview (30 ticks, batched into 5 animation frames of 6 ticks each)
-    const initial = initSimState(code, tile, state.pillars, loadout, 'live');
-    if (initial) {
-      state.sim = initial;
-      await new Promise<void>((resolve) => {
-        let vt = 0;
-        function animFrame(): void {
-          if (!state.sim || vt >= 30) {
-            state.sim = null;
-            state.tickEvents = [];
-            state.tickHits = {};
-            state.gridMobColumns = [];
-            resolve();
-            return;
-          }
-          for (let i = 0; i < 6 && vt < 30; i++) {
-            liveTick();
-            vt++;
-            if (state.sim?.mobs.every((m) => m.dead)) {
-              vt = 30;
-              break;
-            }
-          }
-          render();
-          requestAnimationFrame(animFrame);
-        }
-        requestAnimationFrame(animFrame);
-      });
-    }
+    // The 30-tick per-tile live preview animation has been removed: at faster solver
+    // speeds it added a hard ~80ms RAF tax per tile (~8s across 100 tiles). The heatmap
+    // filling in tile-by-tile is the progress signal.
 
     // Headless sims. `prepared` is built incrementally inside optimizePrayerDetailed
     // (we pass it back in on each call), so prepareSimDamage runs at most once per sim.
@@ -238,7 +241,7 @@ export async function startAutozuk(): Promise<void> {
       };
       state.autozukResults[tileIdx] = tileResult;
       playScoreBlip(avgDmg);
-      updateLiveDetail(tile.x, tile.y, tileResult);
+      _pendingDetail = { x: tile.x, y: tile.y, result: tileResult };
       const dmgRound = Math.round(avgDmg);
       const dmgColor = heatmapColor(avgDmg, 1);
       const prayHtml = ([1, 2, 3, 0] as const)
@@ -256,20 +259,37 @@ export async function startAutozuk(): Promise<void> {
         `<div class="feed-bar"><div class="feed-bar-inner" style="width:${barW}%;background:${dmgColor}"></div></div>` +
         `<div class="feed-prayer">${prayHtml}</div>` +
         `<span class="feed-sims">${validResults.length}</span>`;
-      const feedPanel = byId('liveFeedPanel');
-      feedPanel.appendChild(row);
-      feedPanel.scrollTop = feedPanel.scrollHeight;
+      _pendingRows.push(row);
     }
     completedTiles++;
     const pct = 20 + Math.floor((completedTiles / totalTiles) * 80);
-    byId<HTMLElement>('progressFill').style.width = `${pct}%`;
-    render();
+    _pendingProgressPct = pct;
+    scheduleAutozukUiFlush();
+    scheduleRender();
     await new Promise<void>((r) => {
       const ch = new MessageChannel();
       ch.port1.onmessage = () => r();
       ch.port2.postMessage('');
     });
   }
+
+  // Flush any straggler queued UI writes synchronously before the Done block runs,
+  // so the inline "100%" progress + panel resets below aren't overwritten by a stale
+  // RAF flush after the loop exits.
+  if (_pendingRows.length > 0) {
+    const feedPanel = byId('liveFeedPanel');
+    const frag = document.createDocumentFragment();
+    for (const row of _pendingRows) frag.appendChild(row);
+    _pendingRows = [];
+    feedPanel.appendChild(frag);
+  }
+  if (_pendingDetail) {
+    const d = _pendingDetail;
+    _pendingDetail = null;
+    updateLiveDetail(d.x, d.y, d.result);
+  }
+  _pendingProgressPct = -1;
+  _pendingStatusText = null;
 
   // Done
   state.autozukRunning = false;

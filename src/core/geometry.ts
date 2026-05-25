@@ -15,9 +15,31 @@ export function closestTileTo(mob: Mob, tx: number, ty: number): { x: number; y:
   };
 }
 
+// Scratch globals to avoid per-call {x,y} allocations in the hot LOS / distance paths.
+// Read SCRATCH_CX / SCRATCH_CY after calling closestTileToScratch.
+export let SCRATCH_CX = 0;
+export let SCRATCH_CY = 0;
+export function closestTileToScratch(mob: Mob, tx: number, ty: number): void {
+  const mx = mob.x;
+  const my = mob.y;
+  const s = mob.size;
+  const mxRight = mx + s - 1;
+  SCRATCH_CX = tx < mx ? mx : tx > mxRight ? mxRight : tx;
+  const myBottom = my - s + 1;
+  SCRATCH_CY = ty < myBottom ? myBottom : ty > my ? my : ty;
+}
+
 export function distToMob(px: number, py: number, mob: Mob): number {
-  const ct = closestTileTo(mob, px, py);
-  return chebyshev(px, py, ct.x, ct.y);
+  const mx = mob.x;
+  const my = mob.y;
+  const s = mob.size;
+  const mxRight = mx + s - 1;
+  const cx = px < mx ? mx : px > mxRight ? mxRight : px;
+  const myBottom = my - s + 1;
+  const cy = py < myBottom ? myBottom : py > my ? my : py;
+  const dx = px > cx ? px - cx : cx - px;
+  const dy = py > cy ? py - cy : cy - py;
+  return dx > dy ? dx : dy;
 }
 
 export function collidesWithEntities(x: number, y: number, s: number, entities: Entity[]): boolean {

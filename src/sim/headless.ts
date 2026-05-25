@@ -14,9 +14,7 @@ export function runHeadlessSim(
   if (!state) return null;
   for (let i = 0; i < maxTicks; i++) {
     headlessTick(state);
-    let deadCount = 0;
-    for (const m of state.mobs) if (m.dead) deadCount++;
-    if (deadCount === state.mobs.length) {
+    if (state.aliveCount === 0) {
       return {
         attacks: state.attacks,
         completedTick: state.tick,
@@ -36,7 +34,7 @@ export function runHeadlessSim(
         }
         if (m.type !== 'nibbler' && !m.type.startsWith('bloblet')) trappedBig.push(m);
       }
-      if (allNoLOS && deadCount < state.mobs.length) {
+      if (allNoLOS) {
         const valid = checkTrappedValid(trappedBig);
         return {
           attacks: state.attacks,

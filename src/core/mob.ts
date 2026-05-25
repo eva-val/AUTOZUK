@@ -85,16 +85,19 @@ export function startDig(mob: Mob, player: { x: number; y: number }, region: Reg
   else mob.digLocation = { x: player.x - 1, y: player.y + 1 };
 }
 
-export function markMobForProjectileRemoval(mob: Mob, tick: number): void {
+export function markMobForProjectileRemoval(mob: Mob, tick: number, state?: SimState): void {
   if (mob.dead) return;
   mob.hp = 0;
-  if (mob.pendingRemovalTick === undefined || mob.pendingRemovalTick > tick + 1) {
+  const wasUndef = mob.pendingRemovalTick === undefined;
+  if (wasUndef || mob.pendingRemovalTick! > tick + 1) {
     mob.pendingRemovalTick = tick + 1;
     mob.dyingStartTick = tick;
+    if (wasUndef && state) state.pendingDeathCount++;
   }
 }
 
 export function processCorpseExpiry(state: SimState, tick: number): void {
+  if (state.corpsesPending === 0) return;
   for (const mob of state.mobs) {
     if (mob.dead || mob.dying <= 0) continue;
     const remain = (mob.corpseRemovalTick ?? tick) - tick;
@@ -103,6 +106,8 @@ export function processCorpseExpiry(state: SimState, tick: number): void {
       mob.dying = 0;
       mob.corpseRemovalTick = undefined;
       mob.pendingRemovalTick = undefined;
+      state.aliveCount--;
+      state.corpsesPending--;
     } else {
       mob.dying = remain;
     }
@@ -168,7 +173,13 @@ export function moveMobStep(mob: Mob, player: Player, region: Region, mobs: Mob[
   mob.hasLOS = mobHasLOS(region, mob, player);
   if (mob.hasLOS) mob.noLOSTicks = 0;
   else mob.noLOSTicks = (mob.noLOSTicks ?? 0) + 1;
-  if (mob.hasLOS || mob.frozen > 0) return;
+  if (mob.hasLOS || mob.frozen > 0) {
+    // Mob will not move from here. Cache LOS for mobAttackStep, keyed by both mob and
+    // player position so cross-tick staleness (frozen mob, player moved) invalidates.
+    mob._losCacheKey = (mob.x << 18) | ((mob.y & 0x3f) << 12) | ((player.x & 0x3f) << 6) | (player.y & 0x3f);
+    mob._losCacheValue = mob.hasLOS;
+    return;
+  }
   if (mob.hasDig && !mob.hasLOS && !mob.digTimer) {
     if ((mob.attackDelay <= -38 && Math.random() < 0.1) || mob.attackDelay <= -50) {
       startDig(mob, player, region);

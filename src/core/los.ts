@@ -1,5 +1,5 @@
 import type { Mob, Player, Region } from '../types';
-import { chebyshev, closestTileTo, collisionMath } from './geometry';
+import { chebyshev, closestTileTo, closestTileToScratch, collisionMath, SCRATCH_CX, SCRATCH_CY } from './geometry';
 
 export function isWithinMeleeRange(mob: Mob, target: { x: number; y: number }): boolean {
   const dx = target.x - mob.x;
@@ -33,7 +33,7 @@ export function raycast(region: Region, x1: number, y1: number, x2: number, y2: 
   if (dxAbs === 0 && dyAbs === 0) return true;
   if (dxAbs > dyAbs) {
     const xInc = dx > 0 ? 1 : -1;
-    const slope = Math.trunc((dy << 16) / dxAbs);
+    const slope = ((dy << 16) / dxAbs) | 0;
     let y = (y1 << 16) + 0x8000;
     if (dy < 0) y -= 1;
     let xTile = x1;
@@ -47,7 +47,7 @@ export function raycast(region: Region, x1: number, y1: number, x2: number, y2: 
     }
   } else {
     const yInc = dy > 0 ? 1 : -1;
-    const slope = Math.trunc((dx << 16) / dyAbs);
+    const slope = ((dx << 16) / dyAbs) | 0;
     let x = (x1 << 16) + 0x8000;
     if (dx < 0) x -= 1;
     let yTile = y1;
@@ -97,6 +97,6 @@ export function mobHasLOS(region: Region, mob: Mob, target: Player): boolean {
 }
 
 export function playerHasLOS(region: Region, px: number, py: number, mob: Mob, range: number): boolean {
-  const cp = closestTileTo(mob, px, py);
-  return hasLineOfSight(region, px, py, cp.x, cp.y, 1, range, false);
+  closestTileToScratch(mob, px, py);
+  return hasLineOfSight(region, px, py, SCRATCH_CX, SCRATCH_CY, 1, range, false);
 }

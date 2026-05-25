@@ -98,6 +98,11 @@ export interface Mob {
   parentBlobId?: number;
   aggroTarget?: 'player';
   _lastScanTick?: number;
+  // LOS micro-cache: when set, `_losCacheKey` is a packed (x<<16|y) snapshot of the mob's
+  // position at the time `_losCacheValue` was computed. mobHasLOS can be skipped in the
+  // mobAttackStep call after moveMobStep when the mob hasn't moved.
+  _losCacheKey?: number;
+  _losCacheValue?: boolean;
 }
 
 export interface Player {
@@ -222,6 +227,9 @@ export interface SimState {
   attacks: AttackEvent[];
   mobInitHP: Record<number, { hp: number; type: MobType }>;
   mobMap: Map<number, Mob>;
+  aliveCount: number;
+  corpsesPending: number;
+  pendingDeathCount: number;
 }
 
 export type TickEventKind =

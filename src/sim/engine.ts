@@ -29,6 +29,10 @@ import type {
   Tile,
 } from '../types';
 
+// Flat (dx, dy) pairs for the 8 blood-barrage AOE neighbors. Hoisted to module scope so
+// the array is not re-created per player attack.
+const AOE_OFFSETS = new Int8Array([-1, -1, -1, 0, -1, 1, 0, -1, 0, 1, 1, -1, 1, 0, 1, 1]);
+
 export function initSimState(
   spawnCode: string,
   playerPos: Tile,
@@ -71,6 +75,9 @@ export function initSimState(
     attacks: [],
     mobInitHP,
     mobMap,
+    aliveCount: mobs.length,
+    corpsesPending: 0,
+    pendingDeathCount: 0,
   };
 }
 
@@ -87,12 +94,15 @@ export function onMobDeath(mob: Mob, state: SimState, _tick: number): void {
 }
 
 export function processPendingMobDeaths(state: SimState, tick: number): void {
+  if (state.pendingDeathCount === 0) return;
   for (const mob of state.mobs) {
     if (mob.dead || mob.dying > 0) continue;
     if (mob.pendingRemovalTick !== undefined && mob.pendingRemovalTick <= tick) {
       mob.pendingRemovalTick = undefined;
       mob.dying = DEATH_ANIM_TICKS;
       mob.corpseRemovalTick = tick + DEATH_ANIM_TICKS;
+      state.pendingDeathCount--;
+      state.corpsesPending++;
       onMobDeath(mob, state, tick);
     }
   }
@@ -112,6 +122,7 @@ export function spawnBlobletsFromBlob(blob: Mob, state: SimState): Mob[] {
     mobs.push(bl);
     state.mobInitHP[bl.id] = { hp: bl.hp, type: bl.type };
     state.mobMap.set(bl.id, bl);
+    state.aliveCount++;
   }
   return [bm, br, bx];
 }
@@ -225,6 +236,9 @@ export interface ReviveResult {
 export function tryReviveMobFromMager(mob: Mob, state: SimState): ReviveResult | null {
   if (Math.random() >= 0.1 || state.deadMobs.length === 0) return null;
   const toRes = state.deadMobs.shift()!;
+  const wasDead = toRes.dead;
+  const wasDying = toRes.dying;
+  const hadPending = toRes.pendingRemovalTick !== undefined;
   toRes.revivedOnce = true;
   const reviveHp = Math.floor(toRes.maxHp / 2);
   toRes.hp = reviveHp;
@@ -240,6 +254,9 @@ export function tryReviveMobFromMager(mob: Mob, state: SimState): ReviveResult |
   toRes.y = loc.y;
   toRes.aggroTarget = 'player';
   if (!state.mobs.includes(toRes)) state.mobs.push(toRes);
+  if (wasDead) state.aliveCount++;
+  if (wasDying > 0) state.corpsesPending--;
+  if (hadPending) state.pendingDeathCount--;
   mob.attackDelay = mob.atkSpeed * 2;
   const reviveEvent: AttackEvent = {
     tick: state.tick,
@@ -276,7 +293,18 @@ export function mobAttackStep(
   const region = state.region;
   if (mob.dead || mob.dying > 0 || mob.stunned > 0) return { kind: 'idle' };
   mob.hadLOS = mob.hasLOS;
-  mob.hasLOS = mob.range === 1 ? isWithinMeleeRange(mob, player) : mobHasLOS(region, mob, player);
+  if (mob.range === 1) {
+    mob.hasLOS = isWithinMeleeRange(mob, player);
+  } else {
+    const key = (mob.x << 18) | ((mob.y & 0x3f) << 12) | ((player.x & 0x3f) << 6) | (player.y & 0x3f);
+    if (mob._losCacheKey === key && mob._losCacheValue !== undefined) {
+      mob.hasLOS = mob._losCacheValue;
+    } else {
+      mob.hasLOS = mobHasLOS(region, mob, player);
+      mob._losCacheKey = key;
+      mob._losCacheValue = mob.hasLOS;
+    }
+  }
 
   if (mob.hasFlicker) {
     const flickering = mob.attackDelay === 1 && mob.hasLOS;
@@ -385,21 +413,11 @@ export function playerAttackStep(state: SimState, tick: number): PlayerAttackOut
     if (dmg > 0 && player.hp < player.maxHp) {
       player.hp = Math.min(player.maxHp, player.hp + Math.floor(dmg * 0.25));
     }
-    const aoeOffsets: ReadonlyArray<readonly [number, number]> = [
-      [-1, -1],
-      [-1, 0],
-      [-1, 1],
-      [0, -1],
-      [0, 1],
-      [1, -1],
-      [1, 0],
-      [1, 1],
-    ];
     let hitCount = 1;
-    for (const off of aoeOffsets) {
+    for (let oi = 0; oi < 16; oi += 2) {
       if (hitCount >= 9) break;
-      const ax = target.x + off[0];
-      const ay = target.y + off[1];
+      const ax = target.x + AOE_OFFSETS[oi]!;
+      const ay = target.y + AOE_OFFSETS[oi + 1]!;
       for (const m of mobs) {
         if (m.dead || m.dying > 0 || m.pendingRemovalTick !== undefined || m === target) continue;
         if (m.x === ax && m.y === ay) {
@@ -444,37 +462,39 @@ export function playerAttackStep(state: SimState, tick: number): PlayerAttackOut
 export function processMobIncomingProjectiles(state: SimState, tick: number): void {
   for (const mob of state.mobs) {
     if (mob.dead || mob.dying > 0) continue;
-    const rem: typeof mob.incomingProjectiles = [];
-    for (const p of mob.incomingProjectiles) {
+    const arr = mob.incomingProjectiles;
+    if (arr.length === 0) continue;
+    let w = 0;
+    for (let r = 0; r < arr.length; r++) {
+      const p = arr[r]!;
       p.delay--;
       if (p.delay <= 0) {
         if (mob.pendingRemovalTick === undefined) {
           mob.hp -= p.damage;
-          if (mob.hp <= 0) markMobForProjectileRemoval(mob, tick);
+          if (mob.hp <= 0) markMobForProjectileRemoval(mob, tick, state);
         }
       } else {
-        rem.push(p);
+        arr[w++] = p;
       }
     }
-    mob.incomingProjectiles = rem;
+    arr.length = w;
   }
 }
 
 // Process mob projectiles landing on player (headless: just drain; live wrapper applies damage).
 // Returns whether any projectiles arrived this tick (used for auto-retaliate).
 export function drainPlayerIncomingProjectiles(state: SimState): boolean {
-  const incoming = state.player.incomingProjectiles;
-  const rem: typeof incoming = [];
+  const arr = state.player.incomingProjectiles;
+  if (arr.length === 0) return false;
+  let w = 0;
   let anyArrived = false;
-  for (const p of incoming) {
+  for (let r = 0; r < arr.length; r++) {
+    const p = arr[r]!;
     p.delay--;
-    if (p.delay <= 0) {
-      anyArrived = true;
-    } else {
-      rem.push(p);
-    }
+    if (p.delay <= 0) anyArrived = true;
+    else arr[w++] = p;
   }
-  state.player.incomingProjectiles = rem;
+  arr.length = w;
   return anyArrived;
 }
 

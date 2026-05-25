@@ -2,6 +2,47 @@ import { collisionMath } from '../core/geometry';
 import { hasLineOfSight, isWithinMeleeRange } from '../core/los';
 import type { Mob, Region } from '../types';
 
+// Reused across every checkTileExcluded call so we avoid ~4k Mob-shaped allocations
+// per AUTOZUK sweep. Only x/y are mutated; everything else stays fixed.
+const FAKE_TARGET: Mob = {
+  id: -1,
+  type: 'nibbler',
+  letter: 'P',
+  x: 0,
+  y: 0,
+  size: 1,
+  hp: 1,
+  maxHp: 1,
+  atkSpeed: 1,
+  range: 1,
+  style: 'melee',
+  color: '#fff',
+  attackDelay: 0,
+  stunned: 0,
+  frozen: 0,
+  dead: false,
+  dying: -1,
+  dyingStartTick: -1,
+  corpseRemovalTick: undefined,
+  pendingRemovalTick: undefined,
+  revivedOnce: false,
+  hasLOS: false,
+  hadLOS: false,
+  isBlob: false,
+  blobScanPrayer: null,
+  hasDig: false,
+  digTimer: 0,
+  digLocation: null,
+  hasFlicker: false,
+  flickering: false,
+  incomingProjectiles: [],
+  noLOSTicks: 0,
+  currentStyle: null,
+};
+
+// Scratch big-mob shape used for the size>1 melee-range check inside the LOS branch below.
+const SCRATCH_MOB: Pick<Mob, 'x' | 'y' | 'size'> = { x: 0, y: 0, size: 1 };
+
 // A "tile" can be excluded for several reasons: a pillar/mob footprint sits on it,
 // or a high-priority combination of three big mobs (mager/ranger/meleer) can all hit it
 // from spawn. Trapping setups need to avoid being in the same kill zone as multiple big NPCs.
@@ -20,54 +61,31 @@ export function checkTileExcluded(
     if (collisionMath(m.x, m.y, m.size, x, y, 1)) return true;
   }
   // Initial spawn attack-range overlap exclusions only: mager+ranger, ranger+meleer, or mager+meleer.
-  const fakeTarget: Mob = {
-    id: -1,
-    type: 'nibbler',
-    letter: 'P',
-    x,
-    y,
-    size: 1,
-    hp: 1,
-    maxHp: 1,
-    atkSpeed: 1,
-    range: 1,
-    style: 'melee',
-    color: '#fff',
-    attackDelay: 0,
-    stunned: 0,
-    frozen: 0,
-    dead: false,
-    dying: -1,
-    dyingStartTick: -1,
-    corpseRemovalTick: undefined,
-    pendingRemovalTick: undefined,
-    revivedOnce: false,
-    hasLOS: false,
-    hadLOS: false,
-    isBlob: false,
-    blobScanPrayer: null,
-    hasDig: false,
-    digTimer: 0,
-    digLocation: null,
-    hasFlicker: false,
-    flickering: false,
-    incomingProjectiles: [],
-    noLOSTicks: 0,
-    currentStyle: null,
-  };
-  const types = { mager: false, ranger: false, meleer: false };
+  FAKE_TARGET.x = x;
+  FAKE_TARGET.y = y;
+  let hasMager = false;
+  let hasRanger = false;
+  let hasMeleer = false;
   for (const m of mobs) {
-    if (m.type === 'mager' || m.type === 'ranger' || m.type === 'meleer') {
-      const has =
-        m.range === 1
-          ? isWithinMeleeRange({ x: m.x, y: m.y, size: m.size } as Mob, fakeTarget)
-          : hasLineOfSight(region, m.x, m.y, x, y, m.size, m.range, true);
-      if (has) types[m.type] = true;
+    if (m.type !== 'mager' && m.type !== 'ranger' && m.type !== 'meleer') continue;
+    let has: boolean;
+    if (m.range === 1) {
+      SCRATCH_MOB.x = m.x;
+      SCRATCH_MOB.y = m.y;
+      SCRATCH_MOB.size = m.size;
+      has = isWithinMeleeRange(SCRATCH_MOB as Mob, FAKE_TARGET);
+    } else {
+      has = hasLineOfSight(region, m.x, m.y, x, y, m.size, m.range, true);
+    }
+    if (has) {
+      if (m.type === 'mager') hasMager = true;
+      else if (m.type === 'ranger') hasRanger = true;
+      else hasMeleer = true;
     }
   }
-  if (types.mager && types.ranger) return true;
-  if (types.ranger && types.meleer) return true;
-  if (types.mager && types.meleer) return true;
+  if (hasMager && hasRanger) return true;
+  if (hasRanger && hasMeleer) return true;
+  if (hasMager && hasMeleer) return true;
   return false;
 }
 
